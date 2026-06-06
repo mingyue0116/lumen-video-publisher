@@ -1,7 +1,8 @@
-import React, { useState, useRef, useEffect } from "react"
+﻿import React, { useState, useRef, useEffect } from "react"
 
 const DRAFT_KEY = "publish_draft_v2"
-const VERSION = "1.0.0"
+const VIDEO_STORAGE_KEY = "publish_video_data"
+const VERSION = "1.3.0"
 
 const Icons = {
   douyin: React.createElement("svg", { viewBox: "0 0 24 24", width: 16, height: 16, fill: "currentColor", style: { verticalAlign: "middle", marginRight: 4 } },
@@ -48,6 +49,7 @@ function SidePanel() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoName, setVideoName] = useState("");
   const [videoBlobUrl, setVideoBlobUrl] = useState<string | null>(null);
+  const [videoDataUrl, setVideoDataUrl] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [tags, setTags] = useState("");
@@ -59,43 +61,35 @@ function SidePanel() {
 
   // Load draft on mount
   useEffect(() => {
-    chrome.storage.local.get([DRAFT_KEY], (result) => {
-      const draft = result[DRAFT_KEY];
-      if (draft) {
+    chrome.storage.local.get(DRAFT_KEY, (result) => {
+      if (result && result[DRAFT_KEY]) {
+        const draft = result[DRAFT_KEY];
         setTitle(draft.title || "");
         setContent(draft.content || "");
-        setTags((draft.tags || []).join("，"));
-        if (draft.videoName) {
-          setVideoName(draft.videoName + " (需重新选择文件)");
-        }
-        addStatus("已恢复上次未完成的草稿");
+        setTags(draft.tags || "");
+        if (draft.videoName) setVideoName(draft.videoName);
+        if (draft.videoBlobUrl) setVideoBlobUrl(draft.videoBlobUrl);
+        if (draft.videoDataUrl) setVideoDataUrl(draft.videoDataUrl);
+        if (draft.videoFile) setVideoFile(draft.videoFile as unknown as File);
+        if (draft.platform) setSelectedPlatforms(new Set(draft.platform));
       }
     });
   }, []);
 
-  // Listen for status updates from background
-  useEffect(() => {
-    const handler = (msg: any) => {
-      if (msg.action === "STATUS_UPDATE") {
-        addStatus("[" + msg.platform + "] " + msg.message);
-      }
-    };
-    chrome.runtime.onMessage.addListener(handler);
-    return () => chrome.runtime.onMessage.removeListener(handler);
-  }, []);
-
   function addStatus(msg: string) {
     const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    setStatus(prev => ["[" + time + "] " + msg].concat(prev.slice(0, 49)));
+    setStatus(prev => [...prev, `[${time}] ${msg}`]);
   }
 
   function saveDraft(completed: boolean) {
-    const draft = {
+    const draft: any = {
       title,
       content,
-      tags: tags.split(/[，,、s]+/).filter(Boolean),
-      videoName: videoFile ? videoFile.name : videoName.replace(" (需重新选择文件)", ""),
-      savedAt: Date.now(),
+      tags,
+      videoName,
+      videoBlobUrl,
+      videoDataUrl,
+      videoFile,
       platform: Array.from(selectedPlatforms)
     };
     if (completed) {
@@ -120,7 +114,16 @@ function SidePanel() {
       if (videoBlobUrl) URL.revokeObjectURL(videoBlobUrl);
       const url = URL.createObjectURL(file);
       setVideoBlobUrl(url);
-      addStatus("已选择视频: " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + "MB)");
+      // Also read as data URL for cross-context transfer
+      const reader = new FileReader();
+      reader.onload = () => {
+        setVideoDataUrl(reader.result as string);
+        addStatus("视频已加载: " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + "MB)");
+      };
+      reader.onerror = () => {
+        addStatus("视频读取失败: " + reader.error);
+      };
+      reader.readAsDataURL(file);
     }
   }
 
@@ -134,9 +137,9 @@ function SidePanel() {
   }
 
   async function publishToPlatform(platform: string): Promise<number | null> {
-    if (!videoFile || !videoBlobUrl) {
+    if (!videoFile || !videoDataUrl) {
       addStatus("请先选择视频文件");
-      return;
+      return null;
     }
 
     addStatus("打开 " + PLATFORMS.find(p => p.id === platform)?.label + " 页面...");
@@ -145,7 +148,7 @@ function SidePanel() {
     const tabResult = await chrome.runtime.sendMessage({ action: "OPEN_PLATFORM", platform });
     if (!tabResult?.success) {
       addStatus("打开页面失败: " + tabResult?.error);
-      return;
+      return null;
     }
 
     const tabId = tabResult.tabId;
@@ -153,18 +156,43 @@ function SidePanel() {
     // Step 2: Wait and inject MAIN world script
     addStatus("注入发布脚本...");
     await chrome.runtime.sendMessage({ action: "INJECT_MAIN", tabId, platform });
+    await chrome.runtime.sendMessage({ action: "INJECT_MAIN", tabId, platform: "bilibili" });
     await delay(2000);
 
-    // Step 3: Send form data to ISOLATED world content script
-    addStatus("发送数据到 " + PLATFORMS.find(p => p.id === platform)?.label + "...");
-    const tagList = tags.split(/[，,、\\s]+/).filter(Boolean);
+    // Step 3: Store video data in chrome.storage.local (bypasses 64MB message limit)
+    addStatus("存储视频数据到缓存...");
+    const storageKey = VIDEO_STORAGE_KEY + "_" + platform + "_" + Date.now();
+    const tagList = tags.split(/[\uFF0C,，\s]+/).filter(Boolean);
+    await new Promise<void>((resolve, reject) => {
+      chrome.storage.local.set({
+        [storageKey]: {
+          videoDataUrl: videoDataUrl,
+          videoName: videoFile.name,
+          videoType: videoFile.type,
+          title: title,
+          content: content,
+          tags: tagList
+        }
+      }, () => {
+        if (chrome.runtime.lastError) {
+          addStatus("存储视频数据失败: " + chrome.runtime.lastError.message);
+          reject(new Error(chrome.runtime.lastError.message))
+        } else {
+          resolve()
+        }
+      });
+    });
+    addStatus("视频数据已缓存(" + (videoDataUrl.length / 1024 / 1024).toFixed(1) + "MB)");
 
+    // Step 4: Send lightweight message with just the storage key and blobUrl
+    addStatus("发送数据到 " + PLATFORMS.find(p => p.id === platform)?.label + "...");
     try {
       await chrome.tabs.sendMessage(tabId, {
         action: "FILL_FORM",
         platform,
         data: {
-          videoBlobUrl,
+          videoStorageKey: storageKey,
+          videoBlobUrl: videoBlobUrl,
           videoName: videoFile.name,
           videoType: videoFile.type,
           title,
@@ -181,12 +209,16 @@ function SidePanel() {
     return tabId
   }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
+}
+
   async function publishAll() {
     if (selectedPlatforms.size === 0) {
       addStatus("请至少选择一个平台");
       return;
     }
-    if (!videoFile || !videoBlobUrl) {
+    if (!videoFile || !videoDataUrl) {
       addStatus("请先选择视频文件");
       return;
     }
@@ -197,27 +229,24 @@ function SidePanel() {
     var firstTabId: number | null = null
     var platformIndex = 0
     var total = selectedPlatforms.size
-
-    for (const platform of selectedPlatforms) {
+    for (const pid of selectedPlatforms) {
       platformIndex++
-      addStatus("[" + platformIndex + "/" + total + "] " + PLATFORMS.find(p => p.id === platform)?.label + " 正在填写...");
-      try {
-        const tabId = await publishToPlatform(platform);
-        if (platformIndex === 1) firstTabId = tabId;
-      } catch (e: any) {
-        addStatus(PLATFORMS.find(p => p.id === platform)?.label + " 出错: " + e.message);
+      addStatus("[" + platformIndex + "/" + total + "] 开始发布到 " + PLATFORMS.find(p => p.id === pid)?.label)
+      const tabId = await publishToPlatform(pid)
+      if (tabId && !firstTabId) firstTabId = tabId
+      if (platformIndex < total) {
+        addStatus("等待3秒后发布下一个平台...")
+        await delay(3000)
       }
     }
 
-    saveDraft(true);
-    setPublishing(false);
-    addStatus("✔ 所有平台已填写完成，请检查后手动发布!");
+    addStatus("全部发布完成! 请检查各平台页面确认发布结果。")
+    saveDraft(true)
+    setPublishing(false)
 
-    // Switch back to the first platform tab so user can review
     if (firstTabId) {
-      try {
-        await chrome.tabs.update(firstTabId, { active: true });
-      } catch(e) {}
+      addStatus("正在打开第一个平台页面...")
+      await chrome.tabs.update(firstTabId, { active: true })
     }
   }
 
@@ -230,33 +259,26 @@ function SidePanel() {
     setVideoName("");
     if (videoBlobUrl) URL.revokeObjectURL(videoBlobUrl);
     setVideoBlobUrl(null);
+    setVideoDataUrl(null);
     if (videoRef.current) videoRef.current.value = "";
     addStatus("草稿已清除");
   }
 
-  function delay(ms: number) {
-    return new Promise(r => setTimeout(r, ms));
-  }
+  return React.createElement("div", { style: { padding: "16px 12px", fontFamily: "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif" } },
+    React.createElement("h1", { style: { fontSize: 16, fontWeight: 700, marginBottom: 4, color: "#1a1a1a" } }, "视频多平台发布器"),
+    React.createElement("p", { style: { fontSize: 11, color: "#aaa", marginBottom: 16 } }, "v" + VERSION),
 
-  // --- Render ---
-  return React.createElement("div", { style: { padding: 16, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif", fontSize: 14, color: "#333", maxWidth: 400, margin: "0 auto" } },
-    // Header
-    React.createElement("h2", { style: { fontSize: 18, fontWeight: 600, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 } },
-      Icons.video,
-      "视频多平台发布器"
-    ),
-
-    // Video upload
+    // Video selection
     React.createElement("div", { style: { marginBottom: 16 } },
-      React.createElement("label", { style: { display: "block", marginBottom: 6, fontWeight: 500, fontSize: 13, color: "#555" } }, "选择视频文件"),
+      React.createElement("label", { style: { display: "block", marginBottom: 6, fontWeight: 500, fontSize: 13, color: "#555" } }, "视频文件"),
       React.createElement("input", {
         ref: videoRef,
         type: "file",
         accept: "video/*",
         onChange: handleVideoSelect,
-        style: { display: "block", width: "100%", padding: "8px 0", fontSize: 13 }
+        style: { display: "block", width: "100%", padding: "6px 0", fontSize: 13 }
       }),
-      videoName ? React.createElement("div", { style: { fontSize: 12, color: "#666", marginTop: 4 } }, videoName) : null
+      videoName && React.createElement("div", { style: { fontSize: 12, color: "#1677ff", marginTop: 4 } }, videoName)
     ),
 
     // Platform selection
@@ -351,7 +373,7 @@ function SidePanel() {
         style: {
           background: "#f6f8fa", border: "1px solid #e8e8e8", borderRadius: 6,
           padding: 8, height: 200, overflowY: "auto", fontSize: 11,
-          fontFamily: "'Courier New', monospace", color: "#333", lineHeight: 1.6
+          fontFamily: "\"'Courier New'\", monospace", color: "#333", lineHeight: 1.6
         }
       },
         status.length === 0
@@ -360,7 +382,6 @@ function SidePanel() {
       )
     ),
 
-    // Version
     React.createElement("div", { style: { fontSize: 11, color: "#bbb", textAlign: "center", borderTop: "1px solid #eee", paddingTop: 8 } },
       "v" + VERSION
     )

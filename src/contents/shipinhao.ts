@@ -45,7 +45,10 @@ async function injectVideoFile(file: File): Promise<boolean> {
     try {
       var dt = new DataTransfer()
       dt.items.add(file)
-      ;(fileInput as HTMLInputElement).files = dt.files
+      Object.defineProperty(fileInput, "files", {
+        get: function() { return dt.files },
+        configurable: true
+      })
       fileInput.dispatchEvent(new Event("change", { bubbles: true }))
       fileInput.dispatchEvent(new Event("input", { bubbles: true }))
       sendStatus("File injected: " + file.name)
@@ -69,7 +72,10 @@ async function injectVideoFile(file: File): Promise<boolean> {
         try {
           var dt = new DataTransfer()
           dt.items.add(file)
-          ;(newInput as HTMLInputElement).files = dt.files
+          Object.defineProperty(newInput, "files", {
+        get: function() { return dt.files },
+        configurable: true
+      })
           newInput.dispatchEvent(new Event("change", { bubbles: true }))
           sendStatus("File injected after click")
           return true
@@ -258,40 +264,96 @@ async function fillDescription(content: string, tags: string[]): Promise<boolean
 }
 
 
+
 // ===== Message listener =====
+function readStorageData(storageKey) {
+  return new Promise(function(resolve) {
+    chrome.storage.local.get([storageKey], function(result) {
+      if (result && result[storageKey]) {
+        var data = result[storageKey]
+        chrome.storage.local.remove(storageKey, function() {})
+        resolve(data)
+      } else {
+        resolve(null)
+      }
+    })
+  })
+}
+
 chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
   if (msg.action !== "FILL_FORM" || msg.platform !== "shipinhao") return
-
   var data = msg.data
-  if (!data.videoBlobUrl) {
-    sendStatus("No video blob URL received!")
+  sendStatus("Received publish data")
+  // Try blob URL first (same extension origin)
+  if (data.videoBlobUrl) {
+    sendStatus("Fetching video from blob URL...")
+    try {
+      var resp = await fetch(data.videoBlobUrl)
+      var blob = await resp.blob()
+      var videoFile = new File([blob], data.videoName || "video.mp4", { type: data.videoType || blob.type })
+      sendStatus("Video: " + videoFile.name + " (" + (videoFile.size / 1024 / 1024).toFixed(1) + "MB)")
+      await injectDirect(videoFile, data)
+      sendResponse({ received: true })
+      return
+    } catch(e: any) { sendStatus("Blob URL failed: " + e.message) }
+  }
+  // Fallback: read from storage
+  if (data.videoStorageKey) {
+    sendStatus("Reading video data from storage...")
+    var storageData = await readStorageData(data.videoStorageKey)
+    if (!storageData || !storageData.videoDataUrl) {
+      sendStatus("Failed to read video data from storage!")
+      sendResponse({ received: true }); return
+    }
+    data.videoDataUrl = storageData.videoDataUrl
+    data.videoName = storageData.videoName || data.videoName
+    data.videoType = storageData.videoType || data.videoType
+    if (!data.title && storageData.title) data.title = storageData.title
+    if (!data.content && storageData.content) data.content = storageData.content
+    if (!data.tags && storageData.tags) data.tags = storageData.tags
+  } else if (!data.videoDataUrl) {
+    sendStatus("No video data received!")
     sendResponse({ received: true }); return
   }
-
-  sendStatus("Loading video...")
+  // Send INJECT_VIDEO via postMessage to Wujie iframe
+  sendStatus("Sending INJECT_VIDEO to iframe...")
+  window.postMessage({ source: "VIDEO_PUBLISHER_EXTENSION", action: "INJECT_VIDEO", platform: "shipinhao", data: { dataUrl: data.videoDataUrl, fileName: data.videoName || "video.mp4", fileType: data.videoType || "video/mp4" } }, "*")
+  sendStatus("Waiting for iframe injection...")
+  await new Promise(r => setTimeout(r, 10000))
+  // Also try direct injection
+  sendStatus("Trying direct injection...")
   try {
-    var resp = await fetch(data.videoBlobUrl)
-    var blob = await resp.blob()
-    var videoFile = new File([blob], data.videoName, { type: data.videoType || blob.type })
-    sendStatus("Video: " + videoFile.name + " (" + (videoFile.size / 1024 / 1024).toFixed(1) + "MB)")
-
-    sendStatus("Injecting video...")
-    var injected = await injectVideoFile(videoFile)
-    if (!injected) { sendStatus("Video injection FAILED"); sendResponse({ received: true }); return }
-
-    sendStatus("Video injected! Waiting...")
-    await delay(3000)
-
+    var parts = data.videoDataUrl.split(",")
+    if (parts.length >= 2) {
+      var bs = atob(parts[1]); var ms = parts[0].split(":")[1].split(";")[0]
+      var ab = new ArrayBuffer(bs.length); var ia = new Uint8Array(ab)
+      for (var bi = 0; bi < bs.length; bi++) { ia[bi] = bs.charCodeAt(bi) }
+      var vf = new File([ab], data.videoName || "video.mp4", { type: data.videoType || ms || "video/mp4" })
+      sendStatus("Video: " + vf.name + " (" + (vf.size / 1024 / 1024).toFixed(1) + "MB)")
+      await injectDirect(vf, data)
+    }
+  } catch(e: any) { sendStatus("Direct inject error: " + e.message) }
+  // Always fill form
+  try {
     fillTitle(data.title || "")
     await delay(500)
     await fillDescription(data.content || "", data.tags || [])
-
-    sendStatus("All done!")
-  } catch(e: any) {
-    sendStatus("Error: " + e.message)
-  }
-
+  } catch(e: any) { sendStatus("Form fill error: " + e.message) }
+  sendStatus("All done!")
   sendResponse({ received: true })
 })
 
+async function injectDirect(videoFile, data) {
+  var injected = await injectVideoFile(videoFile)
+  if (!injected) { sendStatus("Video injection FAILED"); return }
+  sendStatus("Video injected! Waiting...")
+  await delay(3000)
+  fillTitle(data.title || "")
+  await delay(500)
+  await fillDescription(data.content || "", data.tags || [])
+  sendStatus("All done!")
+}
+
 sendStatus("Bridge ready")
+
+

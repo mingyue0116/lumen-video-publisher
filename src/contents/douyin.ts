@@ -1,4 +1,4 @@
-import type { PlasmoCSConfig } from "plasmo"
+﻿import type { PlasmoCSConfig } from "plasmo"
 
 export const config: PlasmoCSConfig = {
   matches: ["https://creator.douyin.com/*", "https://*.douyin.com/*"],
@@ -10,9 +10,142 @@ function sendStatus(msg: string) {
   console.log("[Douyin] " + msg)
 }
 
-// Direct file injection into page DOM
+function delay(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
+}
+
+// Read published data from chrome.storage.local (bypasses 64MB message limit)
+async function readStorageData(storageKey: string): Promise<any> {
+  return new Promise(function(resolve) {
+    chrome.storage.local.get([storageKey], function(result) {
+      if (chrome.runtime.lastError) {
+        console.error("[Douyin] storage read error:", chrome.runtime.lastError)
+        resolve(null)
+        return
+      }
+      if (result && result[storageKey]) {
+        var data = result[storageKey]
+        chrome.storage.local.remove(storageKey, function() {})
+        resolve(data)
+      } else {
+        resolve(null)
+      }
+    })
+  })
+}
+
+// Try to fetch video from blob URL (same extension origin, no 64MB limit)
+async function fetchVideoFromBlob(blobUrl: string, fileName: string, fileType: string): Promise<File | null> {
+  try {
+    var resp = await fetch(blobUrl)
+    var blob = await resp.blob()
+    var file = new File([blob], fileName || "video.mp4", { type: fileType || blob.type || "video/mp4" })
+    sendStatus("Fetched video from blob URL: " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + "MB)")
+    return file
+  } catch(e: any) {
+    sendStatus("Blob URL fetch failed: " + e.message)
+    return null
+  }
+}
+
+// ===== ISOLATED world form filling (avoids dependency on MAIN world) =====
+function fillTitle(title: string): boolean {
+  if (!title) return false
+  sendStatus("Filling title...")
+  var inputs = document.querySelectorAll("input")
+  for (var i = 0; i < inputs.length; i++) {
+    var inp = inputs[i] as HTMLInputElement
+    var ph = (inp.placeholder || "").toLowerCase()
+    if ((ph.indexOf("标题") >= 0 || ph.indexOf("title") >= 0 || ph.indexOf("输入视频") >= 0) && inp.type !== "hidden" && inp.type !== "file") {
+      try {
+        var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set
+        setter!.call(inp, title)
+        inp.dispatchEvent(new Event("input", { bubbles: true }))
+        inp.dispatchEvent(new Event("change", { bubbles: true }))
+        sendStatus("Title filled")
+        return true
+      } catch(e: any) {}
+    }
+  }
+  // Fallback: first visible non-file input
+  for (var i = 0; i < inputs.length; i++) {
+    var inp = inputs[i] as HTMLInputElement
+    if (inp.type !== "file" && inp.type !== "hidden" && inp.offsetParent !== null) {
+      try {
+        inp.focus()
+        inp.value = title
+        inp.dispatchEvent(new Event("input", { bubbles: true }))
+        inp.dispatchEvent(new Event("change", { bubbles: true }))
+        sendStatus("Title filled (fallback)")
+        return true
+      } catch(e: any) {}
+    }
+  }
+  sendStatus("No title input found")
+  return false
+}
+
+function fillDescription(descText: string): boolean {
+  if (!descText) return false
+  sendStatus("Filling description...")
+  // Try contenteditable
+  var editors = document.querySelectorAll("[contenteditable=true]")
+  for (var i = 0; i < editors.length; i++) {
+    try {
+      editors[i].focus()
+      var sel = window.getSelection()
+      if (sel) {
+        var rng = document.createRange()
+        rng.selectNodeContents(editors[i])
+        sel.removeAllRanges()
+        sel.addRange(rng)
+        document.execCommand("insertText", false, descText)
+        editors[i].dispatchEvent(new Event("input", { bubbles: true }))
+        sendStatus("Description filled")
+        return true
+      }
+    } catch(e: any) {}
+  }
+  // Try textarea
+  var textareas = document.querySelectorAll("textarea")
+  for (var i = 0; i < textareas.length; i++) {
+    try {
+      textareas[i].focus()
+      var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set
+      setter!.call(textareas[i], descText)
+      textareas[i].dispatchEvent(new Event("input", { bubbles: true }))
+      textareas[i].dispatchEvent(new Event("change", { bubbles: true }))
+      sendStatus("Description filled (textarea)")
+      return true
+    } catch(e: any) {}
+  }
+  sendStatus("No description field found")
+  return false
+}
+
+// ===== Inject file directly into page =====
+async function injectFileDirectly(file: File): Promise<boolean> {
+  var inputs = document.querySelectorAll("input[type=file]")
+  for (var i = 0; i < inputs.length; i++) {
+    var inp = inputs[i] as HTMLInputElement
+    try {
+      var dt = new DataTransfer()
+      dt.items.add(file)
+      Object.defineProperty(inp, "files", {
+        get: function() { return dt.files },
+        configurable: true
+      })
+      inp.dispatchEvent(new Event("change", { bubbles: true }))
+      inp.dispatchEvent(new Event("input", { bubbles: true }))
+      sendStatus("Video injected directly into file input")
+      return true
+    } catch(e) {}
+  }
+  return false
+}
+
+// Direct file injection into page DOM (for specific accept types)
 async function injectFile(file: File, acceptType: string): Promise<boolean> {
-  // Try existing file inputs
   var inputs = document.querySelectorAll("input[type=file]")
   for (var i = 0; i < inputs.length; i++) {
     var inp = inputs[i] as HTMLInputElement
@@ -20,7 +153,10 @@ async function injectFile(file: File, acceptType: string): Promise<boolean> {
       try {
         var dt = new DataTransfer()
         dt.items.add(file)
-        inp.files = dt.files
+        Object.defineProperty(inp, "files", {
+          get: function() { return dt.files },
+          configurable: true
+        })
         inp.dispatchEvent(new Event("change", { bubbles: true }))
         inp.dispatchEvent(new Event("input", { bubbles: true }))
         sendStatus("File injected via existing input")
@@ -30,7 +166,6 @@ async function injectFile(file: File, acceptType: string): Promise<boolean> {
       }
     }
   }
-  // Try creating a hidden input
   try {
     var input = document.createElement("input") as HTMLInputElement
     input.type = "file"
@@ -39,7 +174,10 @@ async function injectFile(file: File, acceptType: string): Promise<boolean> {
     document.body.appendChild(input)
     var dt = new DataTransfer()
     dt.items.add(file)
-    input.files = dt.files
+    Object.defineProperty(input, "files", {
+      get: function() { return dt.files },
+      configurable: true
+    })
     input.dispatchEvent(new Event("change", { bubbles: true }))
     input.dispatchEvent(new Event("input", { bubbles: true }))
     sendStatus("File injected via created input")
@@ -70,7 +208,7 @@ async function tryDragDrop(file: File): Promise<boolean> {
   return false
 }
 
-// Monkey-patch createElement (in ISOLATED world, this intercepts extensions' createElement too)
+// Monkey-patch createElement
 var origCE = document.createElement.bind(document)
 ;(document as any).createElement = function(tag: string, opts?: any) {
   var el = origCE(tag, opts) as HTMLInputElement
@@ -78,7 +216,6 @@ var origCE = document.createElement.bind(document)
     var origClick = el.click.bind(el)
     el.click = function() {
       if (el.type === "file") {
-        // File should already be injected by now, but intercept as fallback
         origClick()
       }
     }
@@ -86,73 +223,113 @@ var origCE = document.createElement.bind(document)
   return el
 }
 
-// MAIN listener
-chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
-  if (msg.action !== "FILL_FORM" || msg.platform !== "douyin") return
-  var data = msg.data
-  sendStatus("Received publish data"); console.log("[Douyin] data keys:", Object.keys(data)); console.log("[Douyin] videoData type:", typeof data.videoData, "length:", data.videoData?.byteLength)
+// ===== Handle form fill (title + description + tags) in ISOLATED world =====
+async function handleFormFill(data: any): Promise<void> {
+  // Fill title
+  fillTitle(data.title || "")
+  await delay(1000)
 
-  async function fetchBlob(url: string, name: string, type: string): Promise<File> {
-    var resp = await fetch(url)
-    var blob = await resp.blob()
-    return new File([blob], name, { type: type || blob.type })
-  }
-
-  if (data.videoBlobUrl) {
-    sendStatus("正在加载视频...")
-    try {
-      var videoFile = await fetchBlob(data.videoBlobUrl, data.videoName, data.videoType)
-      sendStatus("Video: " + videoFile.name + " (" + (videoFile.size / 1024 / 1024).toFixed(1) + "MB)")
-
-      await new Promise(r => setTimeout(r, 1000))
-
-      // Try direct injection
-      sendStatus("Injecting video...")
-      var injected = await injectFile(videoFile, "video")
-
-      if (!injected) {
-        sendStatus("Trying drag-drop...")
-        injected = await tryDragDrop(videoFile)
-      }
-
-      if (injected) {
-        sendStatus("Video injected successfully!")
-      } else {
-        sendStatus("All strategies failed - dumping DOM")
-        var all = document.querySelectorAll("*")
-        var found: any[] = []
-        for (var i = 0; i < all.length; i++) {
-          var el = all[i]
-          var cls = (el.className || "").toString().toLowerCase()
-          var tag = el.tagName.toLowerCase()
-          if ((tag === "input" && (el as HTMLInputElement).type === "file") || cls.indexOf("upload") >= 0 || cls.indexOf("video") >= 0 || cls.indexOf("drop") >= 0) {
-            var r = el.getBoundingClientRect()
-            found.push({tag: tag, id: el.id, cls: cls.substring(0, 60), w: Math.round(r.width), h: Math.round(r.height), accept: (el as HTMLInputElement).accept || ""})
-          }
-        }
-        sendStatus("DOM: " + JSON.stringify(found).substring(0, 600))
-      }
-
-                    // Cover upload skipped - user will upload manually
-// Fill form fields via MAIN world
-      await new Promise(r => setTimeout(r, 1000))
-      window.postMessage({
-        source: "VIDEO_PUBLISHER_EXTENSION",
-        action: "FILL_FORM_TEXT",
-        platform: "douyin",
-        data: { title: data.title || "", content: data.content || "", tags: data.tags || [] }
-      }, window.location.origin)
-
-      sendStatus("All done!")
-    } catch(e: any) {
-      sendStatus("Error: " + e.message)
+  // Build description with tags - EACH tag gets # prefix
+  var descText = data.content || ""
+  if (data.tags && data.tags.length > 0) {
+    var tagStr = ""
+    for (var t = 0; t < data.tags.length; t++) {
+      tagStr += " #" + data.tags[t]
     }
-  } else {
-    sendStatus("No video blob URL received!")
-    console.log("[Douyin] data keys:", Object.keys(data))
+    descText += descText ? "\n" + tagStr.trim() : tagStr.trim()
   }
 
-  sendResponse({ received: true })
+  // Fill description
+  if (descText) {
+    fillDescription(descText)
+  }
+
+  sendStatus("Form filled in ISOLATED world")
+}
+
+// ===== Main flow =====
+async function processPublish(data: any): Promise<void> {
+  sendStatus("Received publish data")
+
+  // Priority 1: Try blob URL first (no 64MB limit, no atob corruption)
+  if (data.videoBlobUrl) {
+    var file = await fetchVideoFromBlob(data.videoBlobUrl, data.videoName, data.videoType)
+    if (file) {
+      var injected = await injectFileDirectly(file)
+      if (injected) {
+        sendStatus("Video injected via blob URL")
+        await delay(3000)
+        await handleFormFill(data)
+        await delay(3000)
+        sendStatus("All done!")
+        return true
+      }
+      sendStatus("Direct injection via blob URL failed, trying storage...")
+    }
+  }
+
+  // Priority 2: Read video data from storage
+  var videoDataUrl: string | null = null
+  var videoName = "video.mp4"
+  var videoType = "video/mp4"
+
+  if (data.videoStorageKey) {
+    sendStatus("Reading video data from storage...")
+    var storageData = await readStorageData(data.videoStorageKey)
+    if (storageData && storageData.videoDataUrl) {
+      videoDataUrl = storageData.videoDataUrl
+      videoName = storageData.videoName || "video.mp4"
+      videoType = storageData.videoType || "video/mp4"
+      if (!data.title && storageData.title) data.title = storageData.title
+      if (!data.content && storageData.content) data.content = storageData.content
+      if (!data.tags && storageData.tags) data.tags = storageData.tags
+    }
+  } else if (data.videoDataUrl) {
+    videoDataUrl = data.videoDataUrl
+    videoName = data.videoName || "video.mp4"
+    videoType = data.videoType || "video/mp4"
+  }
+
+  if (videoDataUrl) {
+    sendStatus("dataUrl ready (" + (videoDataUrl.length / 1024 / 1024).toFixed(1) + "MB)")
+
+    // Send dataUrl to MAIN world via postMessage for file injection
+    sendStatus("Sending to MAIN world via postMessage...")
+    window.postMessage({
+      source: "VIDEO_PUBLISHER_EXTENSION",
+      action: "INJECT_VIDEO",
+      platform: "douyin",
+      data: {
+        dataUrl: videoDataUrl,
+        fileName: videoName,
+        fileType: videoType
+      }
+    }, window.location.origin)
+
+    sendStatus("Video data sent to MAIN world, waiting for injection...")
+    await delay(5000)
+  } else {
+    sendStatus("No video data received!")
+    return false
+  }
+
+  // Fill form in ISOLATED world (not relying on MAIN world which may not have handler)
+  await handleFormFill(data)
+  await delay(3000)
+  sendStatus("All done!")
+  return true
+}
+
+// MAIN listener
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.action !== "FILL_FORM" || msg.platform !== "douyin") return
+  processPublish(msg.data).then((result) => {
+    sendResponse({ received: true, success: result })
+  }).catch((e) => {
+    sendStatus("Error: " + e.message)
+    sendResponse({ received: true, success: false })
+  })
+  return true // keep channel open for async response
 })
 
 // Forward STATUS from MAIN world

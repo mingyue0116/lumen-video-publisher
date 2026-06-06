@@ -151,7 +151,7 @@ function setupUniversalAntiDetection() {
   console.log("[AntiDetection] Activated for " + location.hostname)
 }
 
-function setupDouyinPublisher() {
+function setupDouyinPublisher() { if (typeof setupShipinhaoPublisher === "function") { setupShipinhaoPublisher(); }
   if ((window as any).__dyPublisherInjected) return
   ;(window as any).__dyPublisherInjected = true
 

@@ -1,4 +1,4 @@
-import type { PlasmoCSConfig } from "plasmo"
+﻿import type { PlasmoCSConfig } from "plasmo"
 
 export const config: PlasmoCSConfig = {
   matches: ["https://member.bilibili.com/*", "https://t.bilibili.com/*"],
@@ -28,7 +28,21 @@ function waitForElement(selector: string, timeout = 30000): Promise<Element | nu
   })
 }
 
-// ===== File injection (reference approach) =====
+// Try to fetch video from blob URL (same extension origin, no 64MB limit)
+async function fetchVideoFromBlob(blobUrl: string, fileName: string, fileType: string): Promise<File | null> {
+  try {
+    var resp = await fetch(blobUrl)
+    var blob = await resp.blob()
+    var file = new File([blob], fileName || "video.mp4", { type: fileType || blob.type || "video/mp4" })
+    sendStatus("Fetched video from blob URL: " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + "MB)")
+    return file
+  } catch(e: any) {
+    sendStatus("Blob URL fetch failed: " + e.message)
+    return null
+  }
+}
+
+// ===== File injection =====
 async function injectVideoFile(file: File): Promise<boolean> {
   sendStatus("Looking for upload area...")
 
@@ -43,7 +57,7 @@ async function injectVideoFile(file: File): Promise<boolean> {
   var targetInput: HTMLInputElement | null = null
   for (var i = 0; i < fileInputs.length; i++) {
     var inp = fileInputs[i] as HTMLInputElement
-    if (inp.name === "upload" || (inp.accept && (inp.accept.indexOf("video") >= 0 || inp.accept.indexOf("*" ) >= 0))) {
+    if (inp.name === "upload" || (inp.accept && (inp.accept.indexOf("video") >= 0 || inp.accept.indexOf("*") >= 0))) {
       targetInput = inp
       break
     }
@@ -57,9 +71,12 @@ async function injectVideoFile(file: File): Promise<boolean> {
   try {
     var dt = new DataTransfer()
     dt.items.add(file)
-    targetInput.files = dt.files
+    Object.defineProperty(targetInput, "files", {
+        get: function() { return dt.files },
+        configurable: true
+      })
 
-    // Try clicking the upload button (reference approach)
+    // Try clicking the upload button
     var addBtn = document.querySelector(".bili-pics-uploader__add, [class*=uploader__add], [class*=add-btn], [class*=upload-btn]")
     if (addBtn) {
       sendStatus("Clicking upload button...")
@@ -143,177 +160,95 @@ function setInputValue(inp: HTMLInputElement, value: string): boolean {
     inp.dispatchEvent(new Event("change", { bubbles: true }))
     return true
   } catch(e: any) {
-    sendStatus("Property setter failed: " + e.message)
     try {
       inp.value = value
       inp.dispatchEvent(new Event("input", { bubbles: true }))
       return true
-    } catch(e2: any) {}
+    } catch(e2: any) {
+      sendStatus("setInputValue error: " + e2.message)
+      return false
+    }
   }
-  return false
 }
 
 // ===== Description filling =====
-function fillDescription(content: string): boolean {
-  if (!content) return false
+function fillDescription(text: string): boolean {
+  if (!text) return false
   sendStatus("Filling description...")
 
-  // Strategy 1: Find textarea (Bilibili uses textarea for description)
+  // Try textarea
   var textareas = document.querySelectorAll("textarea")
-  sendStatus("Found " + textareas.length + " textareas")
-
   for (var i = 0; i < textareas.length; i++) {
     var ta = textareas[i] as HTMLTextAreaElement
-    if (ta.offsetParent !== null || ta.getBoundingClientRect().width > 0) {
-      sendStatus("Found visible textarea, filling...")
+    if (!ta.closest(".bili-comment")) {
       try {
         var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set
-        setter!.call(ta, content)
+        setter!.call(ta, text)
         ta.dispatchEvent(new Event("input", { bubbles: true }))
         ta.dispatchEvent(new Event("change", { bubbles: true }))
         sendStatus("Description filled via textarea")
-        return true
-      } catch(e: any) {
-        sendStatus("Textarea setter failed: " + e.message)
-        // Direct value set
-        try {
-          ta.value = content
-          ta.dispatchEvent(new Event("input", { bubbles: true }))
-          ta.dispatchEvent(new Event("change", { bubbles: true }))
-          sendStatus("Description filled via textarea direct")
-          return true
-        } catch(e2: any) {}
-      }
-    }
-  }
-
-  // Strategy 2: Try contenteditable (in case Bilibili uses rich editor)
-  var editors = document.querySelectorAll("div[contenteditable=true]")
-  sendStatus("Found " + editors.length + " contenteditable divs")
-
-  for (var i = 0; i < editors.length; i++) {
-    var ed = editors[i] as HTMLElement
-    try {
-      ed.focus()
-      // execCommand insertText
-      var sel = window.getSelection()
-      var rng = document.createRange()
-      rng.selectNodeContents(ed)
-      sel.removeAllRanges()
-      sel.addRange(rng)
-      var ok = document.execCommand("insertText", false, content)
-      if (ok) {
-        ed.dispatchEvent(new Event("input", { bubbles: true }))
-        sendStatus("Description via contenteditable execCommand")
-        return true
-      }
-      // ClipboardEvent paste
-      var dt = new DataTransfer()
-      dt.setData("text/plain", content)
-      var evt = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt })
-      ed.dispatchEvent(evt)
-      ed.dispatchEvent(new Event("input", { bubbles: true }))
-      sendStatus("Description via ClipboardEvent paste")
-      return true
-    } catch(e: any) {
-      sendStatus("Contenteditable fill failed: " + e.message)
-    }
-  }
-
-  // Strategy 3: Any input that looks like a description field
-  var allInputs = document.querySelectorAll("input:not([type=file]):not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio])")
-  for (var i = 0; i < allInputs.length; i++) {
-    var inp = allInputs[i] as HTMLInputElement
-    if (!inp.value && inp.offsetParent !== null) {
-      sendStatus("Trying empty visible input for description")
-      try {
-        var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set
-        setter!.call(inp, content)
-        inp.dispatchEvent(new Event("input", { bubbles: true }))
-        sendStatus("Description via input fallback")
         return true
       } catch(e: any) {}
     }
   }
 
-  sendStatus("No description field found!")
+  // Try contenteditable
+  var editors = document.querySelectorAll("[contenteditable=true]")
+  for (var i = 0; i < editors.length; i++) {
+    try {
+      editors[i].focus()
+      var sel = window.getSelection()
+      if (sel) {
+        var rng = document.createRange()
+        rng.selectNodeContents(editors[i])
+        sel.removeAllRanges()
+        sel.addRange(rng)
+        document.execCommand("insertText", false, text)
+        sendStatus("Description filled via contenteditable")
+        return true
+      }
+    } catch(e: any) {}
+  }
+
+  sendStatus("No description field found")
   return false
 }
 
-
-// ===== Tags filling =====
+// ===== Tags filling (Bilibili specific) =====
 async function fillTags(tags: string[]): Promise<boolean> {
   if (!tags || tags.length === 0) return false
-  sendStatus("Filling tags... Count: " + tags.length)
+  sendStatus("Filling " + tags.length + " tags...")
 
-  // Find the tag input - Bilibili chip input
-  var tagInput: HTMLInputElement | null = null
-
-  // Strategy 1: Find by placeholder
-  var allInputs = document.querySelectorAll("input")
-  sendStatus("Found " + allInputs.length + " total inputs")
-
-  for (var i = 0; i < allInputs.length; i++) {
-    var inp = allInputs[i] as HTMLInputElement
-    var ph = (inp.placeholder || "").toLowerCase()
-    if (ph.indexOf("标签") >= 0 || ph.indexOf("tag") >= 0 || ph.indexOf("输入标签") >= 0 || ph.indexOf("添加标签") >= 0) {
-      tagInput = inp
-      sendStatus("Found tag input by placeholder: " + ph)
-      break
-    }
-  }
-
-  // Strategy 2: Look inside tag container
+  // Find tag input - Bilibili uses a specific tag component
+  var tagInput = document.querySelector("input[placeholder*=\"标签\"]") as HTMLInputElement
   if (!tagInput) {
-    var containers = document.querySelectorAll("[class*=tag], [class*=Topic], [class*=topic]")
-    sendStatus("Searching " + containers.length + " tag containers")
-    for (var i = 0; i < containers.length; i++) {
-      var innerInput = containers[i].querySelector("input")
-      if (innerInput) {
-        tagInput = innerInput as HTMLInputElement
-        sendStatus("Found tag input inside container")
-        break
-      }
-    }
+    tagInput = document.querySelector("input[placeholder*=\"tag\"]") as HTMLInputElement
   }
-
-  // Strategy 3: Smallest input in the form (tags are usually compact inputs)
   if (!tagInput) {
-    var visible: HTMLInputElement[] = []
-    for (var i = 0; i < allInputs.length; i++) {
-      var inp = allInputs[i] as HTMLInputElement
-      var type = (inp.type || "").toLowerCase()
-      if (type !== "hidden" && type !== "file" && inp.offsetParent !== null) {
-        visible.push(inp)
-      }
-    }
-    sendStatus("Visible inputs: " + visible.length)
-    // Tag input is usually the last or second-to-last visible input
-    if (visible.length >= 2) {
-      tagInput = visible[visible.length - 1]
-      sendStatus("Using last visible input as tag input")
-    }
+    tagInput = document.querySelector("input[placeholder*=\"话题\"]") as HTMLInputElement
+  }
+  if (!tagInput) {
+    // Try Bilibili's specific tag input structure
+    tagInput = document.querySelector(".tag-input input, .bili-tag input, [class*=\"tag\"] input") as HTMLInputElement
   }
 
   if (!tagInput) {
-    sendStatus("No tag input found!")
+    sendStatus("No tag input found")
     return false
   }
 
-    // Remove existing tags
-  var removedCount = 0
-  var closeButtons = document.querySelectorAll("[class*=tag-close], [class*=tag-delete], [class*=close], [class*=remove], [aria-label*=remove]")
-  sendStatus("Found " + closeButtons.length + " close buttons")
+  sendStatus("Tag input found, adding tags...")
+  await delay(500)
 
+  // Remove existing tags first
+  var closeButtons = document.querySelectorAll(".tag-item .close, .tag-close, [class*=\"tag\"] [class*=\"close\"], [class*=\"tag\"] [class*=\"del\"], .bili-tag .close")
   for (var i = 0; i < closeButtons.length; i++) {
     try {
       ;(closeButtons[i] as HTMLElement).click()
-      removedCount++
       await delay(200)
     } catch(e: any) {}
   }
 
-  sendStatus("Removed " + removedCount + " existing tags")
   await delay(500)
 
   // Add each tag
@@ -321,90 +256,130 @@ async function fillTags(tags: string[]): Promise<boolean> {
     var tagText = tags[i].trim()
     if (!tagText) continue
     sendStatus("Adding tag " + (i+1) + ": " + tagText)
-
-    // For first tag, add extra delay
     if (i === 0) await delay(1000)
 
-    // Click + focus to ensure React state
     tagInput.click()
     tagInput.focus()
     tagInput.dispatchEvent(new Event("mousedown", { bubbles: true }))
     tagInput.dispatchEvent(new Event("focus", { bubbles: true }))
     await delay(200)
 
-    // Clear and set value
     try {
       tagInput.value = ""
       tagInput.dispatchEvent(new InputEvent("input", { inputType: "insertText", bubbles: true, cancelable: true }))
       await delay(200)
-
       var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set
       setter!.call(tagInput, tagText)
       tagInput.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: tagText, bubbles: true, cancelable: true }))
       tagInput.dispatchEvent(new Event("change", { bubbles: true }))
     } catch(e: any) {
-      // Fallback to direct
       tagInput.value = tagText
       tagInput.dispatchEvent(new Event("input", { bubbles: true }))
       tagInput.dispatchEvent(new Event("change", { bubbles: true }))
     }
     await delay(400)
 
-    // Enter key
     var enterOpts = { key: "Enter", keyCode: 13, which: 13, code: "Enter", bubbles: true, cancelable: true }
     tagInput.dispatchEvent(new KeyboardEvent("keydown", enterOpts))
     tagInput.dispatchEvent(new KeyboardEvent("keypress", enterOpts))
     tagInput.dispatchEvent(new KeyboardEvent("keyup", enterOpts))
-
     await delay(800)
   }
 
-sendStatus("All tags processed")
+  sendStatus("All tags processed")
   return true
 }
 
-
 // ===== Message listener =====
+
+// Read published data from chrome.storage.local (bypasses 64MB message limit)
+function readStorageData(storageKey) {
+  return new Promise(function(resolve) {
+    chrome.storage.local.get([storageKey], function(result) {
+      if (result && result[storageKey]) {
+        var data = result[storageKey]
+        chrome.storage.local.remove(storageKey, function() {})
+        resolve(data)
+      } else {
+        resolve(null)
+      }
+    })
+  })
+}
+
 chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
   if (msg.action !== "FILL_FORM" || msg.platform !== "bilibili") return
 
   var data = msg.data
-  if (!data.videoBlobUrl) {
-    sendStatus("No video blob URL received!")
+  sendStatus("Received publish data")
+
+  // Priority 1: Try blob URL first
+  if (data.videoBlobUrl) {
+    var file = await fetchVideoFromBlob(data.videoBlobUrl, data.videoName, data.videoType)
+    if (file) {
+      var injected = await injectVideoFile(file)
+      if (injected) {
+        sendStatus("Video injected via blob URL, proceeding to form fill...")
+        await delay(3000)
+        // Fill form directly in ISOLATED world
+        fillTitle(data.title || "")
+        await delay(500)
+        fillDescription(data.content || "")
+        await delay(500)
+        await fillTags(data.tags || [])
+        sendStatus("All done!")
+        sendResponse({ received: true })
+        return
+      }
+      sendStatus("Blob URL injection failed, trying storage fallback...")
+    }
+  }
+
+  // Priority 2: Read from storage
+  if (data.videoStorageKey) {
+    sendStatus("Reading video data from storage...")
+    var storageData = await readStorageData(data.videoStorageKey)
+    if (!storageData || !storageData.videoDataUrl) {
+      sendStatus("Failed to read video data from storage!")
+      sendResponse({ received: true })
+      return
+    }
+    data.videoDataUrl = storageData.videoDataUrl
+    data.videoName = storageData.videoName || data.videoName
+    data.videoType = storageData.videoType || data.videoType
+    if (!data.title && storageData.title) data.title = storageData.title
+    if (!data.content && storageData.content) data.content = storageData.content
+    if (!data.tags && storageData.tags) data.tags = storageData.tags
+  } else if (!data.videoDataUrl) {
+    sendStatus("No video data URL received!")
     sendResponse({ received: true })
     return
   }
 
   sendStatus("Loading video...")
   try {
-    var resp = await fetch(data.videoBlobUrl)
-    var blob = await resp.blob()
-    var videoFile = new File([blob], data.videoName, { type: data.videoType || blob.type })
-    sendStatus("Video: " + videoFile.name + " (" + (videoFile.size / 1024 / 1024).toFixed(1) + "MB)")
+    sendStatus("dataUrl ready (" + (data.videoDataUrl.length / 1024 / 1024).toFixed(1) + "MB)")
 
-    // Upload video
-    sendStatus("Injecting video...")
-    var injected = await injectVideoFile(videoFile)
-    if (!injected) {
-      sendStatus("Video injection FAILED")
-      sendResponse({ received: true })
-      return
-    }
+    // Send to MAIN world via postMessage for file injection
+    sendStatus("Sending to MAIN world via postMessage...")
+    window.postMessage({
+      source: "VIDEO_PUBLISHER_EXTENSION",
+      action: "INJECT_VIDEO",
+      platform: "bilibili",
+      data: {
+        dataUrl: data.videoDataUrl,
+        fileName: data.videoName || "video.mp4",
+        fileType: data.videoType || "video/mp4"
+      }
+    }, window.location.origin)
 
-    sendStatus("Video injected! Waiting for processing...")
-    await delay(3000)
-
-    // Fill title
+    sendStatus("Video data sent to MAIN world, waiting for injection...")
+    await delay(8000)
     fillTitle(data.title || "")
-
     await delay(500)
-
-    // Fill description (tags are separate on Bilibili)
     fillDescription(data.content || "")
-
-    // Fill tags separately
+    await delay(500)
     await fillTags(data.tags || [])
-
     sendStatus("All done!")
   } catch(e: any) {
     sendStatus("Error: " + e.message)
@@ -414,3 +389,10 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
 })
 
 sendStatus("Bridge ready")
+
+// Forward STATUS from MAIN world
+window.addEventListener("message", (ev) => {
+  if (ev.data?.source === "VIDEO_PUBLISHER_EXTENSION" && ev.data?.action === "STATUS") {
+    chrome.runtime.sendMessage({ action: "STATUS", platform: "bilibili", message: ev.data.message }).catch(() => {})
+  }
+})
