@@ -23,6 +23,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(err => sendResponse({ success: false, error: err.message }))
     return true
   }
+  if (msg.action === "CDP_FILL_FORM") {
+    // CDP form filling from any active tab
+    chrome.tabs.query({ active: true, currentWindow: true }, function(tabs) {
+      if (tabs && tabs[0] && tabs[0].id) {
+        sendResponse({ success: true })
+        cdpFillForm(tabs[0].id, msg.title || "", msg.descText || "").catch(function(e) {
+          console.error("[BG] CDP form fill error:", e)
+        })
+      } else {
+        sendResponse({ success: false, error: "No active tab" })
+      }
+    })
+    return true
+  }
   if (msg.action === "INJECT_MAIN") {
     var platform = msg.platform || "douyin"
     var injectFn = getInjectFunction(platform)
@@ -624,4 +638,115 @@ function waitForTabLoad(tabId: number): Promise<void> {
 
 function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms))
+}
+
+// ===== CDP (Chrome DevTools Protocol) - Stable approach =====
+// Runs code directly in page context, bypasses all frameworks
+
+async function cdpInjectVideo(tabId: number, tabUrl: string, fileName: string): Promise<{success: boolean, error?: string}> {
+  try {
+    await attachDebugger(tabId)
+    
+    // Create a script that creates a blob URL from the data URL
+    // We need to get the video data into the page context
+    // Strategy: Inject a script that creates a file input and waits for data
+    
+    // Use Runtime.evaluate to inject a page-context script that listens for custom events
+    await cdpSend(tabId, "Runtime.evaluate", {
+      expression: `
+        window.__cdpVideoData = null;
+        window.__cdpVideoReady = false;
+      `,
+      awaitPromise: false
+    })
+    
+    await detachDebugger(tabId)
+    return { success: true }
+  } catch(e: any) {
+    await detachDebugger(tabId)
+    return { success: false, error: e.message }
+  }
+}
+
+async function cdpFillForm(tabId: number, title: string, descText: string): Promise<{success: boolean, error?: string}> {
+  try {
+    await attachDebugger(tabId)
+    
+    var safeTitle = JSON.stringify(title || "")
+    var safeDesc = JSON.stringify(descText || "")
+    
+    await cdpSend(tabId, "Runtime.evaluate", {
+      expression: `(function() {
+        // Fill title
+        if (${safeTitle}) {
+          var inputs = document.querySelectorAll("input");
+          for (var i = 0; i < inputs.length; i++) {
+            var inp = inputs[i];
+            if (inp.type !== "file" && inp.type !== "hidden") {
+              try {
+                var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+                setter.call(inp, ${safeTitle});
+                inp.dispatchEvent(new Event("input", {bubbles: true}));
+                inp.dispatchEvent(new Event("change", {bubbles: true}));
+                break;
+              } catch(e) {
+                try { inp.value = ${safeTitle}; inp.dispatchEvent(new Event("input", {bubbles: true})); break; } catch(e2) {}
+              }
+            }
+          }
+        }
+        // Fill description
+        if (${safeDesc}) {
+          var eds = document.querySelectorAll("[contenteditable=true]");
+          for (var i = 0; i < eds.length; i++) {
+            try {
+              eds[i].focus();
+              var sel = window.getSelection();
+              var rng = document.createRange();
+              rng.selectNodeContents(eds[i]);
+              sel.removeAllRanges();
+              sel.addRange(rng);
+              document.execCommand("insertText", false, ${safeDesc});
+              eds[i].dispatchEvent(new Event("input", {bubbles: true}));
+              break;
+            } catch(e) {}
+          }
+        }
+      })()`,
+      awaitPromise: false
+    })
+    
+    await detachDebugger(tabId)
+    return { success: true }
+  } catch(e: any) {
+    await detachDebugger(tabId)
+    return { success: false, error: e.message }
+  }
+}
+
+// Helper: Attach debugger
+function attachDebugger(tabId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.attach({ tabId }, "1.3", () => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
+      else resolve()
+    })
+  })
+}
+
+// Helper: Detach debugger
+function detachDebugger(tabId: number): Promise<void> {
+  return new Promise((resolve) => {
+    try { chrome.debugger.detach({ tabId }, () => resolve()) } catch(e) { resolve() }
+  })
+}
+
+// Helper: Send CDP command
+function cdpSend(tabId: number, method: string, params: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand({ tabId }, method, params, (res) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
+      else resolve(res)
+    })
+  })
 }

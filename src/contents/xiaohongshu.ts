@@ -1,3 +1,37 @@
+
+
+// ===== CDP fallback (most stable, bypasses all frameworks) =====
+async function requestCdpFormFill(platform: string, data: any): Promise<boolean> {
+  sendStatus("Requesting CDP fallback...")
+  try {
+    var descText = data.content || ""
+    if (data.tags && data.tags.length > 0) {
+      var tagStr = ""
+      for (var t = 0; t < data.tags.length; t++) {
+        tagStr += " #" + data.tags[t]
+      }
+      descText += (descText ? "\n" : "") + tagStr.trim()
+    }
+    var result = await chrome.runtime.sendMessage({
+      action: "CDP_FILL_FORM",
+      platform: platform,
+      title: data.title || "",
+      descText: descText
+    })
+    if (result && result.success) {
+      sendStatus("CDP form fill successful")
+      return true
+    } else {
+      sendStatus("CDP form fill result: " + (result ? result.error : "no response"))
+      return false
+    }
+  } catch(e: any) {
+    sendStatus("CDP request failed: " + e.message)
+    return false
+  }
+}
+
+
 ﻿import type { PlasmoCSConfig } from "plasmo"
 
 export const config: PlasmoCSConfig = {
@@ -146,7 +180,8 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
 
     sendStatus("Form data sent to MAIN world")
     await delay(3000)
-    sendStatus("All done!")
+      await requestCdpFormFill("xiaohongshu", data)
+  sendStatus("All done!")
   } catch(e: any) {
     sendStatus("Error: " + e.message)
   }
