@@ -1,9 +1,185 @@
 
+import type { PlasmoCSConfig } from "plasmo"
 
-// ===== CDP fallback (most stable, bypasses all frameworks) =====
-async function requestCdpFormFill(platform: string, data: any): Promise<boolean> {
-  sendStatus("Requesting CDP fallback...")
+export const config: PlasmoCSConfig = {
+  matches: ["https://twitter.com/*", "https://x.com/*"],
+  run_at: "document_end"
+}
+
+const PLATFORM = "twitter"
+const VERSION = "1.4.0"
+
+// ===== Logger =====
+function log(step: string, data?: any) {
+  var msg = "[" + step + "] " + (data ? JSON.stringify(data).slice(0,200) : "")
+  chrome.runtime.sendMessage({ action: "STATUS", platform: PLATFORM, message: msg }).catch(() => {})
+  console.log("[" + PLATFORM + "]", step, data || "")
+}
+
+// ===== Utilities =====
+function sleep(ms: number): Promise<void> {
+  return new Promise(function(r) { setTimeout(r, ms) })
+}
+
+function waitForElement(selector: string, timeout = 20000): Promise<Element | null> {
+  return new Promise(function(resolve) {
+    var el = document.querySelector(selector)
+    if (el) { resolve(el); return }
+    var elapsed = 0
+    var iv = setInterval(function() {
+      el = document.querySelector(selector)
+      if (el) { clearInterval(iv); resolve(el); return }
+      elapsed += 500
+      if (elapsed >= timeout) { clearInterval(iv); resolve(null) }
+    }, 500)
+  })
+}
+
+function waitForAnyElement(selectors: string[], timeout = 20000): Promise<Element | null> {
+  return new Promise(function(resolve) {
+    var elapsed = 0
+    var iv = setInterval(function() {
+      for (var s = 0; s < selectors.length; s++) {
+        var el = document.querySelector(selectors[s])
+        if (el) { clearInterval(iv); resolve(el); return }
+      }
+      elapsed += 500
+      if (elapsed >= timeout) { clearInterval(iv); resolve(null) }
+    }, 500)
+  })
+}
+
+function trySelectors(selectors: string[]): Element | null {
+  for (var s = 0; s < selectors.length; s++) {
+    try {
+      var el = document.querySelector(selectors[s])
+      if (el) return el
+    } catch(e) {}
+  }
+  return null
+}
+
+function setNativeValue(el: any, value: string): boolean {
   try {
+    var proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+    var setter = Object.getOwnPropertyDescriptor(proto, "value")!.set
+    setter!.call(el, value)
+    el.dispatchEvent(new Event("input", { bubbles: true }))
+    el.dispatchEvent(new Event("change", { bubbles: true }))
+    return true
+  } catch(e) {
+    try { el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); return true } catch(e2) { return false }
+  }
+}
+
+function setContentEditable(el: HTMLElement, value: string): boolean {
+  try {
+    el.focus()
+    var sel = window.getSelection()
+    if (!sel) return false
+    var rng = document.createRange()
+    rng.selectNodeContents(el)
+    sel.removeAllRanges()
+    sel.addRange(rng)
+    document.execCommand("insertText", false, value)
+    el.dispatchEvent(new Event("input", { bubbles: true }))
+    return true
+  } catch(e) {
+    try { el.innerText = value; el.dispatchEvent(new Event("input", { bubbles: true })); return true } catch(e2) { return false }
+  }
+}
+
+// ===== Video Injection =====
+async function fetchVideoFromBlob(blobUrl: string, fileName: string, fileType: string): Promise<File | null> {
+  try {
+    var resp = await fetch(blobUrl)
+    var blob = await resp.blob()
+    var file = new File([blob], fileName || "video.mp4", { type: fileType || blob.type || "video/mp4" })
+    log("Blob fetch OK: " + (file.size / 1024 / 1024).toFixed(1) + "MB")
+    return file
+  } catch(e: any) {
+    log("Blob fetch failed: " + e.message)
+    return null
+  }
+}
+
+async function injectDataTransfer(file: File): Promise<boolean> {
+  var inputs = document.querySelectorAll("input[type=file]")
+  for (var i = 0; i < inputs.length; i++) {
+    try {
+      var dt = new DataTransfer()
+      dt.items.add(file)
+      Object.defineProperty(inputs[i], "files", {
+        get: function() { return dt.files },
+        configurable: true
+      })
+      ;(inputs[i] as HTMLInputElement).dispatchEvent(new Event("change", { bubbles: true }))
+      ;(inputs[i] as HTMLInputElement).dispatchEvent(new Event("input", { bubbles: true }))
+      log("Injected via DataTransfer")
+      return true
+    } catch(e) {}
+  }
+  return false
+}
+
+// ===== Main State Machine =====
+async function processPublish(data: any): Promise<boolean> {
+  var taskId = "task_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8)
+  log("Task start", { taskId: taskId, platform: PLATFORM, version: VERSION })
+  
+  try {
+    var tabId: number | null = null
+    try {
+      var tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+      if (tabs[0]?.id) tabId = tabs[0].id
+    } catch(e) {}
+    
+    // === Video injection ===
+    var videoInjected = false
+    
+    if (data.videoBlobUrl) {
+      var file = await fetchVideoFromBlob(data.videoBlobUrl, data.videoName, data.videoType)
+      if (file) {
+        videoInjected = await injectDataTransfer(file)
+      }
+    }
+    
+    if (!videoInjected && data.videoStorageKey) {
+      log("Storage fallback...")
+      var storageData = await new Promise<any>(function(resolve) {
+        chrome.storage.local.get([data.videoStorageKey], function(result) {
+          if (chrome.runtime.lastError) { resolve(null); return }
+          var d = result[data.videoStorageKey]
+          chrome.storage.local.remove(data.videoStorageKey, function() {})
+          resolve(d)
+        })
+      })
+      
+      if (storageData && storageData.videoDataUrl) {
+        window.postMessage({
+          source: "VIDEO_PUBLISHER_EXTENSION",
+          action: "INJECT_VIDEO",
+          platform: PLATFORM,
+          data: {
+            dataUrl: storageData.videoDataUrl,
+            fileName: storageData.videoName || "video.mp4",
+            fileType: storageData.videoType || "video/mp4"
+          }
+        }, window.location.origin)
+        await sleep(5000)
+        videoInjected = true
+        if (!data.title && storageData.title) data.title = storageData.title
+        if (!data.content && storageData.content) data.content = storageData.content
+        if (!data.tags && storageData.tags) data.tags = storageData.tags
+      }
+    }
+    
+    log("Video injection: " + (videoInjected ? "OK" : "FAILED"))
+    
+    // === Wait for upload ===
+    await sleep(5000)
+    
+    // === Build form data with #tags ===
     var descText = data.content || ""
     if (data.tags && data.tags.length > 0) {
       var tagStr = ""
@@ -12,265 +188,69 @@ async function requestCdpFormFill(platform: string, data: any): Promise<boolean>
       }
       descText += (descText ? "\n" : "") + tagStr.trim()
     }
+    
+    // === Fill form ===
+    await fillForm(data.title || "", descText)
+    
+    // === CDP backup ===
+    if (tabId) {
+      await requestCdpFillForm(tabId, data.title || "", descText)
+    }
+    
+    // === Cleanup ===
+    chrome.storage.local.remove(["publish_draft_v2"], function() {})
+    
+    log("Task complete", { taskId: taskId })
+    return true
+    
+  } catch(e: any) {
+    log("Task failed: " + e.message, { taskId: taskId })
+    return false
+  }
+}
+
+
+async function fillForm(title: string, descText: string): Promise<void> {
+  log("Filling tweet...")
+  if (descText) {
+    var tb = document.querySelector("div[data-testid=tweetTextarea_0], div[role=textbox][contenteditable=true], div[role=textbox]")
+    if (tb) { if (setContentEditable(tb as HTMLElement, descText)) { log("Tweet text: OK"); return } }
+  }
+  log("Form fill complete")
+}
+
+
+// ===== CDP Fallback =====
+async function requestCdpFillForm(tabId: number, title: string, descText: string): Promise<boolean> {
+  try {
     var result = await chrome.runtime.sendMessage({
       action: "CDP_FILL_FORM",
-      platform: platform,
-      title: data.title || "",
+      tabId: tabId,
+      title: title,
       descText: descText
     })
     if (result && result.success) {
-      sendStatus("CDP form fill successful")
+      log("CDP form fill: OK")
       return true
-    } else {
-      sendStatus("CDP form fill result: " + (result ? result.error : "no response"))
-      return false
     }
+    return false
   } catch(e: any) {
-    sendStatus("CDP request failed: " + e.message)
     return false
   }
 }
 
-
-﻿import type { PlasmoCSConfig } from "plasmo"
-
-export const config: PlasmoCSConfig = {
-  matches: ["https://twitter.com/*", "https://x.com/*"],
-  run_at: "document_end"
-}
-
-function sendStatus(msg: string) {
-  chrome.runtime.sendMessage({ action: "STATUS", platform: "twitter", message: msg }).catch(() => {})
-  console.log("[Twitter] " + msg)
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms))
-}
-
-// Try to fetch video from blob URL (same extension origin, no 64MB limit)
-async function fetchVideoFromBlob(blobUrl: string, fileName: string, fileType: string): Promise<File | null> {
-  try {
-    var resp = await fetch(blobUrl)
-    var blob = await resp.blob()
-    var file = new File([blob], fileName || "video.mp4", { type: fileType || blob.type || "video/mp4" })
-    sendStatus("Fetched video from blob URL: " + file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + "MB)")
-    return file
-  } catch(e: any) {
-    sendStatus("Blob URL fetch failed: " + e.message)
-    return null
-  }
-}
-
-// ===== File injection =====
-async function injectVideoFile(file: File): Promise<boolean> {
-  sendStatus("Looking for upload area...")
-
-  var fileInput = document.querySelector("input[data-testid=fileInput][type=file]")
-  if (!fileInput) {
-    fileInput = document.querySelector("input[type=file]")
-  }
-
-  if (!fileInput) {
-    var mediaBtn = document.querySelector("div[aria-label='Media'], div[aria-label='媒體'], [data-testid=mediaUploadButton]")
-    if (mediaBtn) {
-      sendStatus("Clicking media button...")
-      ;(mediaBtn as HTMLElement).click()
-      await delay(2000)
-      fileInput = document.querySelector("input[data-testid=fileInput][type=file]")
-    }
-  }
-
-  if (!fileInput) {
-    sendStatus("No file input found")
-    return false
-  }
-
-  sendStatus("Found file input, injecting...")
-  try {
-    var dt = new DataTransfer()
-    dt.items.add(file)
-    Object.defineProperty(fileInput, "files", {
-        get: function() { return dt.files },
-        configurable: true
-      })
-    fileInput.dispatchEvent(new Event("change", { bubbles: true }))
-    fileInput.dispatchEvent(new Event("input", { bubbles: true }))
-    sendStatus("File injected: " + file.name)
-    return true
-  } catch(e: any) {
-    sendStatus("Inject failed: " + e.message)
-    return false
-  }
-}
-
-// ===== Tweet text filling =====
-async function fillTweetText(text: string): Promise<boolean> {
-  if (!text) return false
-  sendStatus("Filling tweet text...")
-
-  var textbox = document.querySelector("div[data-testid=tweetTextarea_0], div[role=textbox][contenteditable=true]")
-  if (!textbox) {
-    textbox = document.querySelector("div[role=textbox]")
-  }
-  if (!textbox) {
-    sendStatus("No tweet textbox found")
-    return false
-  }
-
-  sendStatus("Textbox found: " + textbox.tagName + " testid=" + (textbox.getAttribute("data-testid") || "none"))
-
-  var ed = textbox as HTMLElement
+// ===== Message handler =====
+chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+  if (msg.action !== "FILL_FORM" || msg.platform !== PLATFORM) return
   
-  try {
-    ed.focus()
-    ed.click()
-    await delay(500)
-
-    var sel = window.getSelection()
-    if (!sel) { sendStatus("No selection"); return false }
-    var rng = document.createRange()
-    rng.selectNodeContents(ed)
-    sel.removeAllRanges()
-    sel.addRange(rng)
-
-    var dt = new DataTransfer()
-    dt.setData("text/plain", text)
-
-    var pasteEvent = new ClipboardEvent("paste", {
-      bubbles: true,
-      cancelable: true,
-      clipboardData: dt
-    })
-    ed.dispatchEvent(pasteEvent)
-    
-    sendStatus("Tweet text filled via simulated paste (" + text.length + " chars)")
-    return true
-  } catch(e: any) {
-    sendStatus("paste approach failed: " + e.message)
-  }
-
-  try {
-    ed.focus()
-    var sel = window.getSelection()
-    if (sel) {
-      var rng = document.createRange()
-      rng.selectNodeContents(ed)
-      sel.removeAllRanges()
-      sel.addRange(rng)
-      document.execCommand("insertText", false, text)
-      sendStatus("Tweet text via insertText (fallback)")
-      return true
-    }
-  } catch(e: any) {
-    sendStatus("fallback failed: " + e.message)
-  }
-
-  return false
-}
-
-// ===== Message listener =====
-
-function readStorageData(storageKey) {
-  return new Promise(function(resolve) {
-    chrome.storage.local.get([storageKey], function(result) {
-      if (result && result[storageKey]) {
-        var data = result[storageKey]
-        chrome.storage.local.remove(storageKey, function() {})
-        resolve(data)
-      } else {
-        resolve(null)
-      }
-    })
+  processPublish(msg.data).then(function(result) {
+    sendResponse({ received: true, success: result })
+  }).catch(function(e) {
+    log("Handler error: " + e.message)
+    sendResponse({ received: true, success: false })
   })
-}
-
-chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
-  if (msg.action !== "FILL_FORM" || msg.platform !== "twitter") return
-
-  var data = msg.data
-  sendStatus("Received publish data")
-
-  // Build tweet text: title + content + tags with #
-  var tweetText = data.title || ""
-  if (data.content) {
-    tweetText += (tweetText ? "\n\n" : "") + data.content
-  }
-  if (data.tags && data.tags.length > 0) {
-    var tagStr = ""
-    for (var t = 0; t < data.tags.length; t++) {
-      tagStr += " #" + data.tags[t]
-    }
-    tweetText += tweetText ? "\n\n" + tagStr.trim() : tagStr.trim()
-  }
-
-  // Priority 1: Try blob URL first
-  if (data.videoBlobUrl) {
-    var file = await fetchVideoFromBlob(data.videoBlobUrl, data.videoName, data.videoType)
-    if (file) {
-      var injected = await injectVideoFile(file)
-      if (injected) {
-        sendStatus("Video injected via blob URL, filling text...")
-        await delay(3000)
-        await fillTweetText(tweetText)
-        sendStatus("All done!")
-        sendResponse({ received: true })
-        return
-      }
-      sendStatus("Blob URL injection failed, trying storage fallback...")
-    }
-  }
-
-  // Priority 2: Read from storage
-  if (data.videoStorageKey) {
-    sendStatus("Reading video data from storage...")
-    var storageData = await readStorageData(data.videoStorageKey)
-    if (storageData && storageData.videoDataUrl) {
-      data.videoDataUrl = storageData.videoDataUrl
-      data.videoName = storageData.videoName || data.videoName
-      data.videoType = storageData.videoType || data.videoType
-      if (!data.title && storageData.title) data.title = storageData.title
-      if (!data.content && storageData.content) data.content = storageData.content
-      if (!data.tags && storageData.tags) data.tags = storageData.tags
-    }
-  }
-    
-  // Video injection via MAIN world
-  if (data.videoDataUrl) {
-    sendStatus("Loading video...")
-    try {
-      sendStatus("dataUrl ready (" + (data.videoDataUrl.length / 1024 / 1024).toFixed(1) + "MB)")
-
-      sendStatus("Sending to MAIN world via postMessage...")
-      window.postMessage({
-        source: "VIDEO_PUBLISHER_EXTENSION",
-        action: "INJECT_VIDEO",
-        platform: "twitter",
-        data: {
-          dataUrl: data.videoDataUrl,
-          fileName: data.videoName || "video.mp4",
-          fileType: data.videoType || "video/mp4"
-        }
-      }, window.location.origin)
-
-      sendStatus("Video data sent to MAIN world, waiting for injection...")
-      await delay(8000)
-    } catch(e: any) {
-      sendStatus("Video error: " + e.message)
-    }
-  }
-
-  await fillTweetText(tweetText)
-    await requestCdpFormFill("twitter", data)
-  sendStatus("All done!")
-  sendResponse({ received: true })
+  
+  return true
 })
 
-sendStatus("Bridge ready")
-
-// Forward STATUS from MAIN world
-window.addEventListener("message", (ev) => {
-  if (ev.data?.source === "VIDEO_PUBLISHER_EXTENSION" && ev.data?.action === "STATUS") {
-    chrome.runtime.sendMessage({ action: "STATUS", platform: "twitter", message: ev.data.message }).catch(() => {})
-  }
-})
+log("Adapter ready (v" + VERSION + ")")

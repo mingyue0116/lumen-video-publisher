@@ -45,7 +45,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(err => sendResponse({ success: false, error: err.message }))
     return true
   }
-  if (msg.action === "STATUS") {
+    if (msg.action === "CDP_FILL_FORM") {
+    if (!msg.tabId) {
+      sendResponse({ success: false, error: "No tabId" })
+      return true
+    }
+    cdpFillForm(msg.tabId, msg.title || "", msg.descText || "")
+      .then((res) => sendResponse(res))
+      .catch((err) => sendResponse({ success: false, error: err.message }))
+    return true
+  }
+    if (msg.action === "STATUS") {
     chrome.runtime.sendMessage({ action: "STATUS_UPDATE", platform: msg.platform, message: msg.message }).catch(() => {})
   }
 })
@@ -633,6 +643,89 @@ function waitForTabLoad(tabId: number): Promise<void> {
       }
     }
     chrome.tabs.onUpdated.addListener(handler)
+  })
+}
+
+
+
+// ===== CDP (Chrome DevTools Protocol) Engine =====
+// Most stable approach - runs code directly in page context
+
+async function cdpFillForm(tabId: number, title: string, descText: string): Promise<{success: boolean, error?: string}> {
+  try {
+    await attachDebugger(tabId)
+    
+    var safeTitle = JSON.stringify(title || "")
+    var safeDesc = JSON.stringify(descText || "")
+    
+    // Shipinhao needs special Wujie-aware handling
+    var isShipinhao = false
+    try {
+      var tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+      if (tabs[0]?.url?.indexOf("channels.weixin.qq.com") >= 0) isShipinhao = true
+    } catch(e) {}
+    
+    var expr = ""
+    if (isShipinhao) {
+      expr = "(function(){var roots=[document];var app=document.querySelector('wujie-app');if(app&&app.shadowRoot){roots.push(app.shadowRoot);var iframe=app.shadowRoot.querySelector('iframe');if(iframe&&iframe.contentDocument)roots.push(iframe.contentDocument)}for(var r=0;r<roots.length;r++){var root=roots[r];" +
+        "if(" + safeTitle + "){var inputs=root.querySelectorAll('input');for(var i=0;i<inputs.length;i++){var inp=inputs[i];" +
+        "if(inp.type!=='file'&&inp.type!=='hidden'){var ph=(inp.placeholder||'').toLowerCase();" +
+        "if(ph.indexOf('\\u6807\\u9898')>=0||ph.indexOf('title')>=0||ph.indexOf('\\u6982\\u62ec')>=0){" +
+        "try{var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(inp," + safeTitle + ");inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}))}catch(e){inp.value=" + safeTitle + ";inp.dispatchEvent(new Event('input',{bubbles:true}))}" +
+        "break}}}}" +
+        "if(" + safeDesc + "){var eds=root.querySelectorAll('[contenteditable=true]');for(var i=0;i<eds.length;i++){try{eds[i].focus();var sel=window.getSelection();var rng=document.createRange();rng.selectNodeContents(eds[i]);sel.removeAllRanges();sel.addRange(rng);document.execCommand('insertText',false," + safeDesc + ");eds[i].dispatchEvent(new Event('input',{bubbles:true}));break}catch(e){}}}}" +
+        "}})()"
+    } else {
+      expr = "(function(){" +
+        "if(" + safeTitle + "){" +
+        "var inputs=document.querySelectorAll('input');" +
+        "for(var i=0;i<inputs.length;i++){" +
+        "var inp=inputs[i];if(inp.type!=='file'&&inp.type!=='hidden'){" +
+        "try{var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;s.call(inp," + safeTitle + ");inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));break}" +
+        "catch(e){try{inp.value=" + safeTitle + ";inp.dispatchEvent(new Event('input',{bubbles:true}));break}catch(e2){}}}" +
+        "}}" +
+        "if(" + safeDesc + "){" +
+        "var eds=document.querySelectorAll('[contenteditable=true]');" +
+        "for(var i=0;i<eds.length;i++){" +
+        "try{eds[i].focus();var sel=window.getSelection();var rng=document.createRange();rng.selectNodeContents(eds[i]);sel.removeAllRanges();sel.addRange(rng);document.execCommand('insertText',false," + safeDesc + ");eds[i].dispatchEvent(new Event('input',{bubbles:true}));break}" +
+        "catch(e){}}}" +
+        "}})()"
+    }
+    
+    await cdpSend(tabId, "Runtime.evaluate", {
+      expression: expr,
+      awaitPromise: false
+    })
+    
+    await detachDebugger(tabId)
+    return { success: true }
+  } catch(e: any) {
+    await detachDebugger(tabId)
+    return { success: false, error: e.message }
+  }
+}
+
+async function attachDebugger(tabId: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.attach({ tabId }, "1.3", () => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
+      else resolve()
+    })
+  })
+}
+
+function detachDebugger(tabId: number): Promise<void> {
+  return new Promise((resolve) => {
+    try { chrome.debugger.detach({ tabId }, () => resolve()) } catch(e) { resolve() }
+  })
+}
+
+function cdpSend(tabId: number, method: string, params: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand({ tabId }, method, params, (res) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
+      else resolve(res)
+    })
   })
 }
 

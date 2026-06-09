@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react"
 
 const DRAFT_KEY = "publish_draft_v2"
 const VIDEO_STORAGE_KEY = "publish_video_data"
-const VERSION = "1.3.0"
+const VERSION = "1.4.0"
 
 const Icons = {
   douyin: React.createElement("svg", { viewBox: "0 0 24 24", width: 16, height: 16, fill: "currentColor", style: { verticalAlign: "middle", marginRight: 4 } },
