@@ -1,44 +1,44 @@
 {
-    "name":  "video-publisher",
-    "version":  "2.0.0",
-    "displayName":  "视频多平台发布器",
-    "description":  "一键发布视频到抖音/小红书/B站/视频号/Twitter",
-    "scripts":  {
-                    "dev":  "plasmo dev",
-                    "build":  "plasmo build",
-                    "package":  "plasmo package"
-                },
-    "dependencies":  {
-                         "plasmo":  "latest",
-                         "playwright":  "^1.60.0",
-                         "react":  "18.2.0",
-                         "react-dom":  "18.2.0"
-                     },
-    "devDependencies":  {
-                            "@types/chrome":  "0.0.258",
-                            "@types/react":  "18.2.48",
-                            "@types/react-dom":  "18.2.18",
-                            "javascript-obfuscator":  "^5.4.3",
-                            "typescript":  "5.3.3"
-                        },
-    "manifest":  {
-                     "permissions":  [
-                                         "storage",
-                                         "scripting",
-                                         "sidePanel",
-                                         "tabs",
-                                         "activeTab",
-                                         "debugger",
-                                         "unlimitedStorage",
-                                         "webNavigation"
-                                     ],
-                     "host_permissions":  [
-                                              "https://creator.douyin.com/*",
-                                              "https://*.douyin.com/*",
-                                              "https://creator.xiaohongshu.com/*",
-                                              "https://member.bilibili.com/*",
-                                              "https://channels.weixin.qq.com/*",
-                                              "https://twitter.com/*"
-                                          ]
-                 }
+  "name": "video-publisher",
+  "version": "2.1.0",
+  "displayName": "视频多平台发布器",
+  "description": "一键发布视频到抖音/小红书/B站/视频号/Twitter",
+  "scripts": {
+    "dev": "plasmo dev",
+    "build": "plasmo build",
+    "package": "plasmo package"
+  },
+  "dependencies": {
+    "plasmo": "latest",
+    "playwright": "^1.60.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.0.258",
+    "@types/react": "18.2.48",
+    "@types/react-dom": "18.2.18",
+    "javascript-obfuscator": "^5.4.3",
+    "typescript": "5.3.3"
+  },
+  "manifest": {
+    "permissions": [
+      "storage",
+      "scripting",
+      "sidePanel",
+      "tabs",
+      "activeTab",
+      "debugger",
+      "unlimitedStorage",
+      "webNavigation"
+    ],
+    "host_permissions": [
+      "https://creator.douyin.com/*",
+      "https://*.douyin.com/*",
+      "https://creator.xiaohongshu.com/*",
+      "https://member.bilibili.com/*",
+      "https://channels.weixin.qq.com/*",
+      "https://twitter.com/*"
+    ]
+  }
 }

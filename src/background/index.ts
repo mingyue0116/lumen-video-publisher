@@ -1,6 +1,29 @@
-﻿// ===== Video Publisher v2.0.0 - Background Service Worker =====
+// ===== Video Publisher v2.1.0 - Background Task Queue =====
 
-const VERSION = "2.0.0"
+const VERSION = "2.1.0"
+const TASKS_KEY = "publishTasks"
+const RUNTIME_KEY = "platformRuntime"
+
+interface PlatformState {
+  status: string  // pending | opened | claimed | filling | done | error
+  tabId?: number
+  url?: string
+  error?: string
+  claimedAt?: number
+}
+
+interface PublishTask {
+  taskId: string
+  title: string
+  content: string
+  tags: string[]
+  videoStorageKey: string
+  videoFileName: string
+  videoFileType: string
+  createdAt: number
+  updatedAt: number
+  platforms: Record<string, PlatformState>
+}
 
 const PLATFORM_URLS: Record<string, string> = {
   douyin: "https://creator.douyin.com/creator-micro/content/upload",
@@ -10,6 +33,7 @@ const PLATFORM_URLS: Record<string, string> = {
   twitter: "https://x.com/compose/post"
 }
 
+// ===== Side Panel =====
 chrome.action.onClicked.addListener(async (tab) => {
   if (tab.id) await chrome.sidePanel.open({ tabId: tab.id })
 })
@@ -20,237 +44,289 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 // ===== Message Router =====
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // Open a platform page
-  if (msg.action === "OPEN_PLATFORM") {
-    openPlatformTab(msg.platform)
-      .then((tab) => sendResponse({ success: true, tabId: tab.id }))
-      .catch(err => sendResponse({ success: false, error: err.message }))
-    return true
-  }
-
-  // Forward FILL_FORM to the content script in the target tab
-  if (msg.action === "SEND_FILL_FORM") {
-    if (!msg.tabId) {
-      sendResponse({ success: false, error: "No tabId" })
-      return true
-    }
-    chrome.tabs.sendMessage(msg.tabId, {
-      action: "FILL_FORM",
-      platform: msg.platform,
-      data: msg.data
-    }).then((resp) => {
-      sendResponse(resp || { success: false, error: "No response" })
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message })
-    })
-    return true
-  }
-
-  // CDP form fill - bypass frameworks
-  if (msg.action === "CDP_FILL_FORM") {
-    if (!msg.tabId) {
-      sendResponse({ success: false, error: "No tabId" })
-      return true
-    }
-    cdpFillForm(msg.tabId, msg.title || "", msg.descText || "")
-      .then((res) => sendResponse(res))
+  // Side panel: create a new task
+  if (msg.action === "CREATE_TASK") {
+    handleCreateTask(msg.payload)
+      .then((task) => sendResponse({ success: true, task: task }))
       .catch((err) => sendResponse({ success: false, error: err.message }))
     return true
   }
 
-  // Inject MAIN world script for platforms that need it
-  if (msg.action === "INJECT_MAIN") {
-    injectMainScript(msg.tabId, msg.platform || "douyin")
-      .then(() => sendResponse({ success: true }))
-      .catch(err => sendResponse({ success: false, error: err.message }))
+  // Side panel: get all tasks
+  if (msg.action === "GET_TASKS") {
+    getTasks()
+      .then((tasks) => sendResponse({ success: true, tasks: tasks }))
+      .catch((err) => sendResponse({ success: false, error: err.message }))
     return true
   }
 
-  // Relay STATUS messages from content scripts to side panel
-  if (msg.action === "STATUS") {
-    chrome.runtime.sendMessage({
-      action: "STATUS_UPDATE",
-      platform: msg.platform,
-      message: msg.message
-    }).catch(() => {})
+  // Side panel: start publishing (open platform pages)
+  if (msg.action === "START_PUBLISH") {
+    startPublishTask(msg.taskId)
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: err.message }))
+    return true
+  }
+
+  // Content script: claim a task for their platform
+  if (msg.action === "CLAIM_TASK") {
+    handleClaimTask(msg.platform, sender)
+      .then((result) => sendResponse(result))
+      .catch((err) => sendResponse({ ok: false, reason: err.message }))
+    return true
+  }
+
+  // Content script: heartbeat
+  if (msg.action === "HEARTBEAT") {
+    handleHeartbeat(msg.platform, sender.tab?.id, msg.url)
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }))
+    return true
+  }
+
+  // Content script: update task status
+  if (msg.action === "UPDATE_TASK_STATUS") {
+    updateTaskStatus(msg.taskId, msg.platform, msg.status, msg.error)
+      .then(() => sendResponse({ ok: true }))
+      .catch(() => sendResponse({ ok: false }))
+    return true
+  }
+
+  // Side panel: remove completed tasks
+  if (msg.action === "CLEAR_TASKS") {
+    clearCompletedTasks()
+      .then(() => sendResponse({ success: true }))
+      .catch(() => sendResponse({ success: false }))
+    return true
   }
 })
 
-// ===== Open Platform Tab =====
-async function openPlatformTab(platform: string) {
-  var url = PLATFORM_URLS[platform]
-  if (!url) throw new Error("Unknown platform: " + platform)
-
-  var tab = await chrome.tabs.create({ url: url, active: false })
-  await waitForTabLoad(tab.id)
-  await delay(2000)
-
-  // Inject MAIN world script
-  injectMainScript(tab.id, platform).catch((e) => {
-    console.log("[BG] Inject MAIN: " + e.message)
-  })
-
-  return tab
+// ===== Task Management =====
+async function getTasks(): Promise<PublishTask[]> {
+  var result = await chrome.storage.local.get([TASKS_KEY])
+  return result[TASKS_KEY] || []
 }
 
-function waitForTabLoad(tabId: number): Promise<void> {
-  return new Promise(function(resolve, reject) {
-    var timer = setTimeout(function() {
-      reject(new Error("Tab load timeout"))
-    }, 30000)
+async function saveTasks(tasks: PublishTask[]): Promise<void> {
+  await chrome.storage.local.set({ [TASKS_KEY]: tasks })
+}
 
-    function listener(tabId2: number, info: any) {
-      if (tabId2 === tabId && info.status === "complete") {
-        clearTimeout(timer)
-        chrome.tabs.onUpdated.removeListener(listener)
-        resolve()
+async function handleCreateTask(payload: any): Promise<PublishTask> {
+  var task: PublishTask = {
+    taskId: "task_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+    title: payload.title || "",
+    content: payload.content || "",
+    tags: payload.tags || [],
+    videoStorageKey: payload.videoStorageKey || "",
+    videoFileName: payload.videoFileName || "video.mp4",
+    videoFileType: payload.videoFileType || "video/mp4",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    platforms: {}
+  }
+
+  var platforms = payload.platforms || ["douyin"]
+  for (var p = 0; p < platforms.length; p++) {
+    task.platforms[platforms[p]] = { status: "pending" }
+  }
+
+  var tasks = await getTasks()
+  tasks.push(task)
+  await saveTasks(tasks)
+
+  return task
+}
+
+async function updateTaskStatus(taskId: string, platform: string, status: string, error?: string): Promise<void> {
+  var tasks = await getTasks()
+  for (var t = 0; t < tasks.length; t++) {
+    if (tasks[t].taskId === taskId && tasks[t].platforms[platform]) {
+      tasks[t].platforms[platform].status = status
+      if (error) tasks[t].platforms[platform].error = error
+      tasks[t].updatedAt = Date.now()
+      break
+    }
+  }
+  await saveTasks(tasks)
+}
+
+async function clearCompletedTasks(): Promise<void> {
+  var tasks = await getTasks()
+  var remaining: PublishTask[] = []
+  for (var t = 0; t < tasks.length; t++) {
+    var allDone = true
+    var platformKeys = Object.keys(tasks[t].platforms)
+    for (var p = 0; p < platformKeys.length; p++) {
+      var st = tasks[t].platforms[platformKeys[p]].status
+      if (st !== "done" && st !== "error") {
+        allDone = false
+        break
       }
     }
-    chrome.tabs.onUpdated.addListener(listener)
-  })
+    if (!allDone) {
+      remaining.push(tasks[t])
+    }
+  }
+  await saveTasks(remaining)
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(function(r) { setTimeout(r, ms) })
+// ===== Claim Task Handler =====
+async function handleClaimTask(platform: string, sender: any): Promise<any> {
+  if (!platform) return { ok: false, reason: "NO_PLATFORM" }
+
+  var tasks = await getTasks()
+
+  // Find a task that has this platform pending/opened
+  var task: PublishTask | null = null
+  for (var t = 0; t < tasks.length; t++) {
+    var ps = tasks[t].platforms[platform]
+    if (ps && (ps.status === "pending" || ps.status === "opened")) {
+      task = tasks[t]
+      break
+    }
+  }
+
+  if (!task) {
+    return { ok: false, reason: "NO_TASK" }
+  }
+
+  // Assign task to this content script
+  task.platforms[platform].status = "claimed"
+  task.platforms[platform].tabId = sender.tab?.id
+  task.platforms[platform].claimedAt = Date.now()
+  task.platforms[platform].url = sender.tab?.url || ""
+  task.updatedAt = Date.now()
+
+  await saveTasks(tasks)
+
+  return {
+    ok: true,
+    taskId: task.taskId,
+    platformData: {
+      taskId: task.taskId,
+      platform: platform,
+      title: task.title,
+      content: task.content,
+      tags: task.tags,
+      videoStorageKey: task.videoStorageKey,
+      videoFileName: task.videoFileName,
+      videoFileType: task.videoFileType
+    }
+  }
 }
 
-// ===== MAIN World Script Injection =====
-async function injectMainScript(tabId: number, platform: string) {
+// ===== Heartbeat =====
+async function handleHeartbeat(platform: string, tabId: number | undefined, url: string | undefined): Promise<void> {
+  if (!platform) return
+  var data: any = {}
+  data[RUNTIME_KEY + "_" + platform] = {
+    tabId: tabId,
+    url: url,
+    lastSeenAt: Date.now()
+  }
+  await chrome.storage.local.set(data)
+}
+
+async function getHeartbeat(platform: string): Promise<any | null> {
+  var result = await chrome.storage.local.get([RUNTIME_KEY + "_" + platform])
+  return result[RUNTIME_KEY + "_" + platform] || null
+}
+
+// ===== Start Publishing =====
+async function startPublishTask(taskId: string): Promise<void> {
+  var tasks = await getTasks()
+  var task: PublishTask | null = null
+  for (var t = 0; t < tasks.length; t++) {
+    if (tasks[t].taskId === taskId) {
+      task = tasks[t]
+      break
+    }
+  }
+
+  if (!task) throw new Error("Task not found: " + taskId)
+
+  var platformKeys = Object.keys(task.platforms)
+  for (var p = 0; p < platformKeys.length; p++) {
+    var plat = platformKeys[p]
+    var url = PLATFORM_URLS[plat]
+    if (!url) continue
+
+    try {
+      var tab = await chrome.tabs.create({ url: url, active: false })
+      task.platforms[plat].status = "opened"
+      task.platforms[plat].tabId = tab.id
+      task.platforms[plat].url = url
+
+      // Inject MAIN world script
+      injectMainScript(tab.id).catch(function(e) {
+        console.log("[BG] Inject MAIN:", e.message)
+      })
+    } catch(e: any) {
+      task.platforms[plat].status = "error"
+      task.platforms[plat].error = e.message
+    }
+  }
+
+  task.updatedAt = Date.now()
+  await saveTasks(tasks)
+}
+
+// ===== MAIN Script Injection =====
+async function injectMainScript(tabId: number) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tabId },
       world: "MAIN",
-      func: getMainWorldScript(platform)
+      func: setupMainWorld
     })
-    console.log("[BG] MAIN injected for " + platform)
   } catch(e: any) {
-    console.log("[BG] Inject MAIN failed: " + e.message)
+    console.log("[BG] Inject MAIN:", e.message)
   }
 }
 
-function getMainWorldScript(platform: string): () => void {
-  // Generic anti-detection + video listener for all platforms
-  return function() {
-    try { Object.defineProperty(navigator, "webdriver", { get: function() { return undefined } }) } catch(e) {}
-    try { Object.defineProperty(navigator, "plugins", { get: function() { return [1, 2, 3, 4, 5] } }) } catch(e) {}
-    try { Object.defineProperty(navigator, "languages", { get: function() { return ["zh-CN", "zh", "en"] } }) } catch(e) {}
+function setupMainWorld() {
+  // Anti-detection
+  try { Object.defineProperty(navigator, "webdriver", { get: function() { return undefined } }) } catch(e) {}
+  try { Object.defineProperty(navigator, "plugins", { get: function() { return [1, 2, 3, 4, 5] } }) } catch(e) {}
+  try { Object.defineProperty(navigator, "languages", { get: function() { return ["zh-CN", "zh", "en"] } }) } catch(e) {}
 
-    // Listen for INJECT_VIDEO from content script
-    window.addEventListener("message", function(ev) {
-      if (ev.data && ev.data.source === "VIDEO_PUBLISHER_EXTENSION" && ev.data.action === "INJECT_VIDEO") {
-        var data = ev.data.data
-        if (!data || !data.dataUrl) return
+  // Listen for INJECT_VIDEO from content script
+  window.addEventListener("message", function(ev) {
+    if (ev.data && ev.data.source === "VIDEO_PUBLISHER_EXTENSION" && ev.data.action === "INJECT_VIDEO") {
+      var data = ev.data.data
+      if (!data || !data.dataUrl) return
 
-        fetch(data.dataUrl)
-          .then(function(r) { return r.blob() })
-          .then(function(blob) {
-            var file = new File([blob], data.fileName || "video.mp4", { type: data.fileType || blob.type || "video/mp4" })
-            var dt = new DataTransfer()
-            dt.items.add(file)
-
-            var inputs = document.querySelectorAll("input[type=file]")
-            for (var i = 0; i < inputs.length; i++) {
-              try {
-                Object.defineProperty(inputs[i], "files", {
-                  get: function() { return dt.files },
-                  configurable: true
-                })
-                inputs[i].dispatchEvent(new Event("change", { bubbles: true }))
-                inputs[i].dispatchEvent(new Event("input", { bubbles: true }))
-              } catch(e) {}
-            }
-
-            window.postMessage({
-              source: "VIDEO_PUBLISHER_EXTENSION",
-              action: "INJECT_VIDEO_RESULT",
-              success: true
-            }, window.location.origin)
-          })
-          .catch(function(e) {
-            window.postMessage({
-              source: "VIDEO_PUBLISHER_EXTENSION",
-              action: "INJECT_VIDEO_RESULT",
-              success: false,
-              error: e.message
-            }, window.location.origin)
-          })
-      }
-    })
-  }
-}
-
-// ===== CDP Form Fill (fallback) =====
-async function cdpFillForm(tabId: number, title: string, descText: string): Promise<{success: boolean, error?: string}> {
-  try {
-    await attachDebugger(tabId)
-    var safeTitle = JSON.stringify(title || "")
-    var safeDesc = JSON.stringify(descText || "")
-
-    await cdpSend(tabId, "Runtime.evaluate", {
-      expression: "(function() {" +
-        "if (" + safeTitle + ") {" +
-        "  var inputs = document.querySelectorAll(\"input\");" +
-        "  for (var i = 0; i < inputs.length; i++) {" +
-        "    var inp = inputs[i];" +
-        "    if (inp.type !== 'file' && inp.type !== 'hidden') {" +
-        "      try {" +
-        "        var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;" +
-        "        setter.call(inp, " + safeTitle + ");" +
-        "        inp.dispatchEvent(new Event('input', {bubbles: true}));" +
-        "        inp.dispatchEvent(new Event('change', {bubbles: true}));" +
-        "        break;" +
-        "      } catch(e) {}" +
-        "    }" +
-        "  }" +
-        "}" +
-        "if (" + safeDesc + ") {" +
-        "  var eds = document.querySelectorAll('[contenteditable=true]');" +
-        "  for (var i = 0; i < eds.length; i++) {" +
-        "    try {" +
-        "      eds[i].focus();" +
-        "      var sel = window.getSelection();" +
-        "      var rng = document.createRange();" +
-        "      rng.selectNodeContents(eds[i]);" +
-        "      sel.removeAllRanges();" +
-        "      sel.addRange(rng);" +
-        "      document.execCommand('insertText', false, " + safeDesc + ");" +
-        "      eds[i].dispatchEvent(new Event('input', {bubbles: true}));" +
-        "      break;" +
-        "    } catch(e) {}" +
-        "  }" +
-        "}" +
-      "})()",
-      awaitPromise: false
-    })
-
-    await detachDebugger(tabId)
-    return { success: true }
-  } catch(e: any) {
-    await detachDebugger(tabId).catch(function() {})
-    return { success: false, error: e.message }
-  }
-}
-
-function attachDebugger(tabId: number): Promise<void> {
-  return new Promise(function(resolve, reject) {
-    chrome.debugger.attach({ tabId: tabId }, "1.3", function() {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
-      else resolve()
-    })
-  })
-}
-
-function detachDebugger(tabId: number): Promise<void> {
-  return new Promise(function(resolve) {
-    try { chrome.debugger.detach({ tabId: tabId }, function() { resolve() }) } catch(e) { resolve() }
-  })
-}
-
-function cdpSend(tabId: number, method: string, params: any): Promise<any> {
-  return new Promise(function(resolve, reject) {
-    chrome.debugger.sendCommand({ tabId: tabId }, method, params, function(res) {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message))
-      else resolve(res)
-    })
+      fetch(data.dataUrl)
+        .then(function(r) { return r.blob() })
+        .then(function(blob) {
+          var file = new File([blob], data.fileName || "video.mp4", { type: data.fileType || blob.type || "video/mp4" })
+          var dt = new DataTransfer()
+          dt.items.add(file)
+          var inputs = document.querySelectorAll("input[type=file]")
+          for (var i = 0; i < inputs.length; i++) {
+            try {
+              Object.defineProperty(inputs[i], "files", {
+                get: function() { return dt.files },
+                configurable: true
+              })
+              inputs[i].dispatchEvent(new Event("change", { bubbles: true }))
+              inputs[i].dispatchEvent(new Event("input", { bubbles: true }))
+            } catch(e) {}
+          }
+          window.postMessage({
+            source: "VIDEO_PUBLISHER_EXTENSION",
+            action: "INJECT_VIDEO_RESULT",
+            success: true
+          }, window.location.origin)
+        })
+        .catch(function(e) {
+          window.postMessage({
+            source: "VIDEO_PUBLISHER_EXTENSION",
+            action: "INJECT_VIDEO_RESULT",
+            success: false,
+            error: e.message
+          }, window.location.origin)
+        })
+    }
   })
 }
