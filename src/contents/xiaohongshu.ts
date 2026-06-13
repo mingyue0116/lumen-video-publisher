@@ -6,7 +6,7 @@ export const config: PlasmoCSConfig = {
 }
 
 const PLATFORM = "xiaohongshu"
-const VERSION = "2.1.0"
+const VERSION = "2.2.0"
 
 // ===== Utilities =====
 function logInfo(m) { console.log("["+PLATFORM+"] [INFO]",m); sendS("[INFO] "+m) }

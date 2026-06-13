@@ -1,6 +1,6 @@
 {
   "name": "video-publisher",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "displayName": "视频多平台发布器",
   "description": "一键发布视频到抖音/小红书/B站/视频号/Twitter",
   "scripts": {
@@ -30,7 +30,8 @@
       "activeTab",
       "debugger",
       "unlimitedStorage",
-      "webNavigation"
+      "webNavigation",
+      "tabGroups"
     ],
     "host_permissions": [
       "https://creator.douyin.com/*",
