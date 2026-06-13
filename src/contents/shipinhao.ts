@@ -56,7 +56,7 @@ async function tryInjectVideo(dataUrl, fileName) {
     var btns = document.querySelectorAll("button, div, span")
     for (var i = 0; i < btns.length; i++) {
       var txt = (btns[i].innerText || "").toLowerCase()
-      if (txt.indexOf("上传") >= 0 || txt.indexOf("选择视频") >= 0 || txt.indexOf("select") >= 0 || txt.indexOf("upload") >= 0) {
+      if (txt.indexOf("\u4e0a\u4f20") >= 0 || txt.indexOf("\u9009\u62e9\u89c6\u9891") >= 0 || txt.indexOf("select") >= 0 || txt.indexOf("upload") >= 0) {
         btns[i].click()
         await sleep(1000)
         fi = document.querySelector("input[type=file]")
@@ -118,19 +118,19 @@ function deepQuerySelector(sel, root) {
 }
 
 var adapter = {
-  findTitleInput: function() { return deepQuerySelector("input[placeholder*=\"标题\"], textarea[placeholder*=\"标题\"], input[placeholder*=\"title\"]") },
-  findDescInput: function() { return deepQuerySelector("textarea[placeholder*=\"简介\"], textarea[placeholder*=\"描述\"], div[contenteditable=true], [contenteditable=\"true\"]") },
+  findTitleInput: function() { return deepQuerySelector("input[placeholder*=\"\u6807\u9898\"], textarea[placeholder*=\"\u6807\u9898\"], input[placeholder*=\"title\"]") },
+  findDescInput: function() { return deepQuerySelector("textarea[placeholder*=\"\u7b80\u4ecb\"], textarea[placeholder*=\"\u63cf\u8ff0\"], div[contenteditable=true], [contenteditable=\"true\"]") },
   isFormReady: function() {
     var t = this.findTitleInput()
     return isElementEditable(t)
   },
   detectState: function() {
     var text = document.body.innerText || ""
-    if (/登录|请登录|安全验证/.test(text)) return "ERROR_LOGIN"
+    if (/\u767b\u5f55|\u8bf7\u767b\u5f55|\u5b89\u5168\u9a8c\u8bc1/.test(text)) return "ERROR_LOGIN"
     if (this.isFormReady()) return "FORM_READY"
-    if (/上传中|正在上传/.test(text)) return "UPLOADING"
-    if (/处理中|解析中|转码中/.test(text)) return "PROCESSING"
-    if (/上传视频|选择视频|点击上传|请先上传/.test(text)) return "WAITING_VIDEO"
+    if (/\u4e0a\u4f20\u4e2d|\u6b63\u5728\u4e0a\u4f20/.test(text)) return "UPLOADING"
+    if (/\u5904\u7406\u4e2d|\u89e3\u6790\u4e2d|\u8f6c\u7801\u4e2d/.test(text)) return "PROCESSING"
+    if (/\u4e0a\u4f20\u89c6\u9891|\u9009\u62e9\u89c6\u9891|\u70b9\u51fb\u4e0a\u4f20|\u8bf7\u5148\u4e0a\u4f20/.test(text)) return "WAITING_VIDEO"
     return "UNKNOWN"
   },
   diagnose: function() {
@@ -145,9 +145,9 @@ var adapter = {
       descEditable: isElementEditable(d),
       iframeCount: document.querySelectorAll("iframe").length,
       signals: {
-        uploading: /上传中|正在上传/.test(text),
-        processing: /处理中|解析中|转码中/.test(text),
-        waitingUpload: /上传视频|选择视频|点击上传|请先上传/.test(text)
+        uploading: /\u4e0a\u4f20\u4e2d|\u6b63\u5728\u4e0a\u4f20/.test(text),
+        processing: /\u5904\u7406\u4e2d|\u89e3\u6790\u4e2d|\u8f6c\u7801\u4e2d/.test(text),
+        waitingUpload: /\u4e0a\u4f20\u89c6\u9891|\u9009\u62e9\u89c6\u9891|\u70b9\u51fb\u4e0a\u4f20|\u8bf7\u5148\u4e0a\u4f20/.test(text)
       }
     }
   }
@@ -184,17 +184,17 @@ function showOverlay() {
     if (!_overlay) return
     var d = adapter.diagnose()
     var stateLabels = {
-      FORM_READY: "表单可编辑",
-      UPLOADING: "上传中",
-      PROCESSING: "处理中",
-      WAITING_VIDEO: "等待上传",
-      ERROR_LOGIN: "需登录",
-      UNKNOWN: "未知"
+      FORM_READY: "\u8868\u5355\u53ef\u7f16\u8f91",
+      UPLOADING: "\u4e0a\u4f20\u4e2d",
+      PROCESSING: "\u5904\u7406\u4e2d",
+      WAITING_VIDEO: "\u7b49\u5f85\u4e0a\u4f20",
+      ERROR_LOGIN: "\u9700\u767b\u5f55",
+      UNKNOWN: "\u672a\u77e5"
     }
-    _overlay.innerHTML = "<b>多平台发布助手 ["+PLATFORM+"]</b><br>" +
-      "<span style='font-size:12px'>状态: " + (stateLabels[d.state] || d.state) + "</span><br>" +
-      "<span style='font-size:10px;opacity:0.8'>标题框:" + (d.titleEditable ? "✓" : "✗") +
-      " 简介框:" + (d.descEditable ? "✓" : "✗") +
+    _overlay.innerHTML = "<b>\u591a\u5e73\u53f0\u53d1\u5e03\u52a9\u624b ["+PLATFORM+"]</b><br>" +
+      "<span style='font-size:12px'>\u72b6\u6001: " + (stateLabels[d.state] || d.state) + "</span><br>" +
+      "<span style='font-size:10px;opacity:0.8'>\u6807\u9898\u6846:" + (d.titleEditable ? "\u2713" : "\u2717") +
+      " \u7b80\u4ecb\u6846:" + (d.descEditable ? "\u2713" : "\u2717") +
       " iframe:" + d.iframeCount + "</span>"
   }, 2000)
 }
@@ -209,7 +209,7 @@ function hideOverlay() {
 
 function showFormFillStatus() {
   if (_overlay) {
-    _overlay.innerHTML = "<b>多平台发布助手 ["+PLATFORM+"]</b><br><span style='font-size:11px;opacity:0.9'>正在填写标题、简介、标签...</span>"
+    _overlay.innerHTML = "<b>\u591a\u5e73\u53f0\u53d1\u5e03\u52a9\u624b ["+PLATFORM+"]</b><br><span style='font-size:11px;opacity:0.9'>\u6b63\u5728\u586b\u5199\u6807\u9898\u3001\u7b80\u4ecb\u3001\u6807\u7b7e...</span>"
   }
 }
 
@@ -221,9 +221,9 @@ function wqAll(sel){var d=getWujieDoc();if(d){try{var l=d.querySelectorAll(sel);
 
 async function fillForm(title, descText, tags) {
   logInfo("Filling...")
-  if(title){var inputs=wqAll("input");var ok=false;for(var i=0;i<inputs.length;i++){var inp=inputs[i];if(inp.type==="file"||inp.type==="hidden")continue;var ph=(inp.placeholder||"").toLowerCase();if(ph.indexOf("title")>=0||ph.indexOf("标题")>=0||ph.indexOf("视频")>=0){if(setNativeValue(inp,title)){ok=true;logOk("Title: OK");break}}}if(!ok){for(var i=0;i<inputs.length;i++){if(inputs[i].type!=="file"&&inputs[i].type!=="hidden"){if(setNativeValue(inputs[i],title)){ok=true;logOk("Title: fallback");break}}}}if(!ok)logFail("Title: not found")}
+  if(title){var inputs=wqAll("input");var ok=false;for(var i=0;i<inputs.length;i++){var inp=inputs[i];if(inp.type==="file"||inp.type==="hidden")continue;var ph=(inp.placeholder||"").toLowerCase();if(ph.indexOf("title")>=0||ph.indexOf("\u6807\u9898")>=0||ph.indexOf("\u89c6\u9891")>=0){if(setNativeValue(inp,title)){ok=true;logOk("Title: OK");break}}}if(!ok){for(var i=0;i<inputs.length;i++){if(inputs[i].type!=="file"&&inputs[i].type!=="hidden"){if(setNativeValue(inputs[i],title)){ok=true;logOk("Title: fallback");break}}}}if(!ok)logFail("Title: not found")}
   if(descText){var eds=wqAll("div[contenteditable=true]");var ok=false;for(var i=0;i<eds.length;i++){if(setCE(eds[i],descText)){ok=true;logOk("Desc: OK");break}}if(!ok){var tas=wqAll("textarea");for(var i=0;i<tas.length;i++){if(setNativeValue(tas[i],descText)){ok=true;logOk("Desc: textarea");break}}}if(!ok)logFail("Desc: not found")}
-  if(tags&&tags.length>0){var n=normalizeTags(tags);var ts=n.join(" ");var ok=false;var tis=wqAll("input[placeholder*=\"#\"],input[placeholder*=\"话题\"]");for(var i=0;i<tis.length;i++){if(setNativeValue(tis[i],ts)){tis[i].dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));ok=true;logOk("Tags: OK");break}}if(!ok){var eds=wqAll("div[contenteditable=true]");for(var i=0;i<eds.length;i++){var cur=eds[i].innerText;if(cur&&setCE(eds[i],cur+"\n"+ts)){ok=true;logOk("Tags: appended");break}}}if(!ok)logFail("Tags: not filled")}
+  if(tags&&tags.length>0){var n=normalizeTags(tags);var ts=n.join(" ");var ok=false;var tis=wqAll("input[placeholder*=\"#\"],input[placeholder*=\"\u8bdd\u9898\"]");for(var i=0;i<tis.length;i++){if(setNativeValue(tis[i],ts)){tis[i].dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));ok=true;logOk("Tags: OK");break}}if(!ok){var eds=wqAll("div[contenteditable=true]");for(var i=0;i<eds.length;i++){var cur=eds[i].innerText;if(cur&&setCE(eds[i],cur+"\n"+ts)){ok=true;logOk("Tags: appended");break}}}if(!ok)logFail("Tags: not filled")}
   logInfo("Done")
 }
 
