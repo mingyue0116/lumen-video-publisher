@@ -90,69 +90,127 @@ async function loadVideo(k) {
   } catch(e){return null}
 }
 
-// ===== Upload Detection =====
-function isUploadStarted(fileName) {
-  var text = document.body.innerText || ""
-  var keywords = ["上传中", "上传完成", "上传进度", "解析中", "转码中", "视频处理中", "processing", fileName]
-  for (var i = 0; i < keywords.length; i++) {
-    if (text.indexOf(keywords[i]) >= 0) return true
-  }
-  // Only text-based detection
-  return false
+// ===== State Detection (FORM_READY based) =====
+function isElementEditable(el) {
+  if (!el) return false
+  try {
+    var style = window.getComputedStyle(el)
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false
+    if (el.disabled || el.readOnly) return false
+    var rect = el.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return false
+    return true
+  } catch(e) { return false }
 }
 
-function isUploadComplete() {
-  var text = document.body.innerText || ""
-  if (text.indexOf("上传完成") >= 0 || text.indexOf("upload complete") >= 0 || text.indexOf("upload success") >= 0) return true
-  // Only trust blob: video elements
-  var v = document.querySelector("video[src]")
-  if (v && v.src && v.src.indexOf("blob:") === 0) return true
-  return false
-}
-
-async function waitForUpload(fileName, timeout) {
-  timeout = timeout || 600000
-  logInfo("Waiting for upload...")
-  while (timeout > 0) {
-    if (isUploadStarted(fileName)) {
-      logOk("Upload started")
-      var extra = 60000
-      while (extra > 0) {
-        if (isUploadComplete()) {
-          await sleep(3000)
-          logOk("Upload complete")
-          return true
-        }
-        await sleep(1000)
-        extra -= 1000
-      }
-      logInfo("Upload did not confirm completion within 60s, continuing...")
-      return true
+function deepQuerySelector(sel, root) {
+  root = root || document
+  var found = root.querySelector(sel)
+  if (found) return found
+  var all = root.querySelectorAll("*")
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].shadowRoot) {
+      var f = deepQuerySelector(sel, all[i].shadowRoot)
+      if (f) return f
     }
-    await sleep(1000)
-    timeout -= 1000
   }
-  logFail("Upload timeout")
-  return false
+  return null
 }
 
-// ===== Overlay (show when waiting for manual upload) =====
+var adapter = {
+  findTitleInput: function() { return deepQuerySelector("input[placeholder*=\"标题\"], textarea[placeholder*=\"标题\"], input[placeholder*=\"title\"]") },
+  findDescInput: function() { return deepQuerySelector("textarea[placeholder*=\"简介\"], textarea[placeholder*=\"描述\"], div[contenteditable=true], [contenteditable=\"true\"]") },
+  isFormReady: function() {
+    var t = this.findTitleInput()
+    return isElementEditable(t)
+  },
+  detectState: function() {
+    var text = document.body.innerText || ""
+    if (/登录|请登录|安全验证/.test(text)) return "ERROR_LOGIN"
+    if (this.isFormReady()) return "FORM_READY"
+    if (/上传中|正在上传/.test(text)) return "UPLOADING"
+    if (/处理中|解析中|转码中/.test(text)) return "PROCESSING"
+    if (/上传视频|选择视频|点击上传|请先上传/.test(text)) return "WAITING_VIDEO"
+    return "UNKNOWN"
+  },
+  diagnose: function() {
+    var t = this.findTitleInput()
+    var d = this.findDescInput()
+    var text = document.body.innerText || ""
+    return {
+      state: this.detectState(),
+      titleExists: !!t,
+      titleEditable: isElementEditable(t),
+      descExists: !!d,
+      descEditable: isElementEditable(d),
+      iframeCount: document.querySelectorAll("iframe").length,
+      signals: {
+        uploading: /上传中|正在上传/.test(text),
+        processing: /处理中|解析中|转码中/.test(text),
+        waitingUpload: /上传视频|选择视频|点击上传|请先上传/.test(text)
+      }
+    }
+  }
+}
+
+async function waitForFormReady(timeout) {
+  timeout = timeout || 900000
+  logInfo("Waiting for form ready...")
+  return new Promise(function(resolve) {
+    var observer = new MutationObserver(function() {
+      if (adapter.isFormReady()) { cleanup(); resolve(true) }
+    })
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true })
+    var timer = setInterval(function() {
+      timeout -= 1000
+      if (timeout <= 0) { cleanup(); logFail("Form not ready within timeout"); resolve(false); return }
+      if (adapter.isFormReady()) { cleanup(); resolve(true); return }
+    }, 1000)
+    function cleanup() { observer.disconnect(); clearInterval(timer) }
+    if (adapter.isFormReady()) { cleanup(); resolve(true) }
+  })
+}
+
+// ===== Diagnostic Overlay =====
 var _overlay = null
-function showOverlay(fileName) {
+function showOverlay() {
   if (_overlay) return
   _overlay = document.createElement("div")
   _overlay.id = "vp_overlay"
   _overlay.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#1677ff;color:#fff;padding:8px 16px;font-size:13px;font-family:sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.15)"
-  _overlay.innerHTML = "多平台发布助手 ["+PLATFORM+"]<br><span style='font-size:11px;opacity:0.9'>请手动选择视频文件："+fileName+"<br>检测到上传后自动填写标题、简介、标签</span>"
   document.body.prepend(_overlay)
+  // Update diagnostic info every 2s
+  _overlay._timer = setInterval(function() {
+    if (!_overlay) return
+    var d = adapter.diagnose()
+    var stateLabels = {
+      FORM_READY: "表单可编辑",
+      UPLOADING: "上传中",
+      PROCESSING: "处理中",
+      WAITING_VIDEO: "等待上传",
+      ERROR_LOGIN: "需登录",
+      UNKNOWN: "未知"
+    }
+    _overlay.innerHTML = "<b>多平台发布助手 ["+PLATFORM+"]</b><br>" +
+      "<span style='font-size:12px'>状态: " + (stateLabels[d.state] || d.state) + "</span><br>" +
+      "<span style='font-size:10px;opacity:0.8'>标题框:" + (d.titleEditable ? "✓" : "✗") +
+      " 简介框:" + (d.descEditable ? "✓" : "✗") +
+      " iframe:" + d.iframeCount + "</span>"
+  }, 2000)
 }
 
 function hideOverlay() {
-  if (_overlay) { _overlay.remove(); _overlay = null }
+  if (_overlay) {
+    if (_overlay._timer) clearInterval(_overlay._timer)
+    _overlay.remove()
+    _overlay = null
+  }
 }
 
 function showFormFillStatus() {
-  if (_overlay) _overlay.innerHTML = "多平台发布助手 ["+PLATFORM+"]<br><span style='font-size:11px;opacity:0.9'>正在填写标题、简介、标签...</span>"
+  if (_overlay) {
+    _overlay.innerHTML = "<b>多平台发布助手 ["+PLATFORM+"]</b><br><span style='font-size:11px;opacity:0.9'>正在填写标题、简介、标签...</span>"
+  }
 }
 
 // ===== Fill Form (platform specific - replaced per platform) =====
@@ -171,32 +229,26 @@ async function processPublish(data) {
   logInfo("Start")
   var fileName = data.videoFileName || "video.mp4"
   
-  // Step 1: Try auto inject
-  var autoOk = false
+  // Step 1: Show diagnostic overlay
+  showOverlay()
+  
+  // Step 2: Try auto inject (best-effort)
   if (data.videoStorageKey) {
     var du = await loadVideo(data.videoStorageKey)
-    if (du) autoOk = await tryInjectVideo(du, fileName)
+    if (du) await tryInjectVideo(du, fileName)
   }
   
-  // Step 2: If auto failed, show overlay and wait for manual
-  if (!autoOk) {
-    showOverlay(fileName)
-    logInfo("Waiting for manual upload...")
-    await sleep(3000) // give user time
-  } else {
-    logInfo("Auto injected, waiting for upload...")
-  }
-  
-  // Step 3: Wait for upload
-  var uploadOk = await waitForUpload(fileName, autoOk ? 120000 : 600000)
+  // Step 3: Wait for FORM_READY (not upload complete!)
+  logInfo("Waiting for form ready...")
+  var ready = await waitForFormReady(900000)
   hideOverlay()
   
-  if (!uploadOk) {
-    logFail("Upload timeout")
+  if (!ready) {
+    logFail("Form not ready within timeout")
     return
   }
   
-  await sleep(3000)
+  await sleep(2000)
   
   // Step 4: Fill form
   showFormFillStatus()
