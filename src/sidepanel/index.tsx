@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from "react"
 
-const VERSION = "2.2.0"
+const VERSION = "2.3.0"
 const DRAFT_KEY = "publish_draft_v3"
 
 var I: Record<string, React.ReactElement> = {
