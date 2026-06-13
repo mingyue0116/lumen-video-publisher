@@ -6,7 +6,7 @@ export const config: PlasmoCSConfig = {
 }
 
 const PLATFORM = "bilibili"
-const VERSION = "2.3.0"
+const VERSION = "2.4.0"
 var TASK_ID = ""
 
 // ===== Logger =====

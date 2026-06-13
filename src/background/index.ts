@@ -1,6 +1,6 @@
 // ===== Video Publisher v2.2.0 - Workspace + Tab Group =====
 
-const VERSION = "2.3.0"
+const VERSION = "2.4.0"
 const TASKS_KEY = "publishTasks"
 
 interface PlatformState {
