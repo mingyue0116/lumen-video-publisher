@@ -6,7 +6,7 @@ export const config: PlasmoCSConfig = {
 }
 
 const PLATFORM = "douyin"
-const VERSION = "2.4.0"
+const VERSION = "2.4.0" // build: 202911
 var TASK_ID = ""
 
 // ===== Logger =====
@@ -179,23 +179,18 @@ function showOverlay() {
   _overlay.id = "vp_overlay"
   _overlay.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#1677ff;color:#fff;padding:8px 16px;font-size:13px;font-family:sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.15)"
   document.body.prepend(_overlay)
-  // Update diagnostic info every 2s
   _overlay._timer = setInterval(function() {
     if (!_overlay) return
     var d = adapter.diagnose()
-    var stateLabels = {
-      FORM_READY: "\u8868\u5355\u53ef\u7f16\u8f91",
-      UPLOADING: "\u4e0a\u4f20\u4e2d",
-      PROCESSING: "\u5904\u7406\u4e2d",
-      WAITING_VIDEO: "\u7b49\u5f85\u4e0a\u4f20",
-      ERROR_LOGIN: "\u9700\u767b\u5f55",
-      UNKNOWN: "\u672a\u77e5"
-    }
-    _overlay.innerHTML = "<b>\u591a\u5e73\u53f0\u53d1\u5e03\u52a9\u624b ["+PLATFORM+"]</b><br>" +
-      "<span style='font-size:12px'>\u72b6\u6001: " + (stateLabels[d.state] || d.state) + "</span><br>" +
-      "<span style='font-size:10px;opacity:0.8'>\u6807\u9898\u6846:" + (d.titleEditable ? "\u2713" : "\u2717") +
-      " \u7b80\u4ecb\u6846:" + (d.descEditable ? "\u2713" : "\u2717") +
-      " iframe:" + d.iframeCount + "</span>"
+    var sl = {FORM_READY:1,UPLOADING:2,PROCESSING:3,WAITING_VIDEO:4,ERROR_LOGIN:5,UNKNOWN:6}
+    // Build text safely - no innerHTML with Chinese
+    var txt = "mu" + "lti-pub [" + PLATFORM + "]"
+    var st = ["","form ready","uploading","processing","wait video","need login","unknown"][sl[d.state]||6]
+    txt += " | title:" + (d.titleEditable ? "ok" : "no")
+    txt += " desc:" + (d.descEditable ? "ok" : "no")
+    txt += " iframes:" + d.iframeCount
+    _overlay.textContent = txt
+    _overlay.style.fontSize = "11px"
   }, 2000)
 }
 
@@ -208,11 +203,8 @@ function hideOverlay() {
 }
 
 function showFormFillStatus() {
-  if (_overlay) {
-    _overlay.innerHTML = "<b>\u591a\u5e73\u53f0\u53d1\u5e03\u52a9\u624b ["+PLATFORM+"]</b><br><span style='font-size:11px;opacity:0.9'>\u6b63\u5728\u586b\u5199\u6807\u9898\u3001\u7b80\u4ecb\u3001\u6807\u7b7e...</span>"
-  }
+  if (_overlay) _overlay.textContent = "multi-pub ["+PLATFORM+"] filling form..."
 }
-
 // ===== Fill Form (platform specific - replaced per platform) =====
 
 async function fillForm(title, descText, tags) {
