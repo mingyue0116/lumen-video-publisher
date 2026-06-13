@@ -232,7 +232,7 @@ async function fillForm(title: string, descText: string, tags: string[]): Promis
       }
     }
     if (!tagSet && result.desc) {
-      ", "[contenteditable=\"true\"]"]
+      var descSels2 = ["textarea", "div[contenteditable=true]", "[contenteditable=\"true\"]"]
       for (var s2 = 0; s2 < descSels2.length; s2++) {
         var el2 = document.querySelector(descSels2[s2]) as HTMLElement
         if (!el2) continue

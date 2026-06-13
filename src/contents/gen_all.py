@@ -1,1 +1,0 @@
-print("gen script ready")
