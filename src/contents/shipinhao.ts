@@ -1,4 +1,10 @@
 import type { PlasmoCSConfig } from "plasmo"
+import {
+  sleep, setNativeValue, setCE, normalizeTags, isElementEditable,
+  deepQuerySelector, injectVideoToInput,
+  waitForFormReady, showOverlay, hideOverlay, showFormFillStatus,
+  startHB, claimTask, updStatus
+} from "../lib/publisher-utils"
 
 export const config: PlasmoCSConfig = {
   matches: ["https://channels.weixin.qq.com/*"],
@@ -6,134 +12,119 @@ export const config: PlasmoCSConfig = {
 }
 
 const PLATFORM = "shipinhao"
-const VERSION = "2.4.0"
+const VERSION = "3.1.4"
 var TASK_ID = ""
 
 // ===== Logger =====
-function logInfo(m) { console.log("["+PLATFORM+"]",m); sendS(m,"info") }
-function logOk(m) { console.log("["+PLATFORM+"]",m); sendS(m,"ok") }
-function logFail(m) { console.log("["+PLATFORM+"]",m); sendS(m,"fail") }
-function sendS(m,t) { chrome.runtime.sendMessage({action:"STATUS",platform:PLATFORM,message:"["+t+"] "+m}).catch(function(){}) }
+function logInfo(m: string) { console.log("[" + PLATFORM + "]", m); sendS(m, "info") }
+function logOk(m: string) { console.log("[" + PLATFORM + "]", m); sendS(m, "ok") }
+function logFail(m: string) { console.log("[" + PLATFORM + "]", m); sendS(m, "fail") }
+function sendS(m: string, t: string) { chrome.runtime.sendMessage({ action: "STATUS", platform: PLATFORM, message: "[" + t + "] " + m }).catch(function () { }) }
 
-function sleep(ms) { return new Promise(function(r){setTimeout(r,ms)}) }
-
-function waitForElement(sel,to) {
-  to=to||25000; return new Promise(function(resolve) {
-    var el=document.querySelector(sel); if(el){resolve(el);return}
-    var iv=setInterval(function(){el=document.querySelector(sel);if(el){clearInterval(iv);resolve(el);return};to-=500;if(to<=0){clearInterval(iv);resolve(null)}},500)
-  })
-}
-
-function setNativeValue(el,v) {
+// ===== Shipinhao-specific adapter (handles wujie iframe) =====
+function getWujieDoc(): Document | ShadowRoot | null {
   try {
-    var p=el.tagName==="TEXTAREA"?HTMLTextAreaElement.prototype:HTMLInputElement.prototype
-    Object.getOwnPropertyDescriptor(p,"value").set.call(el,v)
-    el.dispatchEvent(new Event("input",{bubbles:true}));el.dispatchEvent(new Event("change",{bubbles:true}))
-    return true
-  } catch(e){try{el.value=v;el.dispatchEvent(new Event("input",{bubbles:true}));return true}catch(e2){return false}}
-}
-
-function setCE(el,v) {
-  try {
-    el.focus();var sel=window.getSelection();if(!sel)return false
-    var r=document.createRange();r.selectNodeContents(el);sel.removeAllRanges();sel.addRange(r)
-    document.execCommand("insertText",false,v)
-    el.dispatchEvent(new Event("input",{bubbles:true}));el.dispatchEvent(new Event("change",{bubbles:true}))
-    return true
-  } catch(e){try{el.innerText=v;el.dispatchEvent(new Event("input",{bubbles:true}));el.dispatchEvent(new Event("change",{bubbles:true}));return true}catch(e2){return false}}
-}
-
-function normalizeTags(t) {
-  var r=[]; for(var i=0;i<t.length;i++){var tag=(t[i]||"").trim();if(!tag)continue;if(tag.indexOf("#")!==0)tag="#"+tag;r.push(tag)}
-  return r
-}
-
-// ===== Video Injection (try auto, fallback to manual) =====
-async function tryInjectVideo(dataUrl, fileName) {
-  var fi = document.querySelector("input[type=file]")
-  if (!fi) {
-    // Click upload button first to reveal file input
-    var btns = document.querySelectorAll("button, div, span")
-    for (var i = 0; i < btns.length; i++) {
-      var txt = (btns[i].innerText || "").toLowerCase()
-      if (txt.indexOf("\u4e0a\u4f20") >= 0 || txt.indexOf("\u9009\u62e9\u89c6\u9891") >= 0 || txt.indexOf("select") >= 0 || txt.indexOf("upload") >= 0) {
-        btns[i].click()
-        await sleep(1000)
-        fi = document.querySelector("input[type=file]")
-        if (fi) break
+    var app = document.querySelector("wujie-app")
+    if (app) {
+      var sr = (app as any).shadowRoot
+      if (sr) {
+        var iframe = sr.querySelector("iframe")
+        if (iframe && iframe.contentDocument && iframe.contentDocument.body) {
+          return iframe.contentDocument
+        }
+        return sr
       }
     }
-  }
-  if (!fi) { logInfo("No file input, will wait for manual"); return false }
-
-  try {
-    var r = await fetch(dataUrl)
-    var blob = await r.blob()
-    var file = new File([blob], fileName || "video.mp4", { type: blob.type || "video/mp4" })
-    var dt = new DataTransfer(); dt.items.add(file)
-    Object.defineProperty(fi, "files", { get: function() { return dt.files }, configurable: true })
-    fi.dispatchEvent(new Event("change", { bubbles: true }))
-    await sleep(200)
-    fi.dispatchEvent(new Event("input", { bubbles: true }))
-    await sleep(200)
-    fi.dispatchEvent(new Event("change", { bubbles: true }))
-    logOk("Auto inject video")
-    return true
-  } catch(e) { logInfo("Auto inject failed: "+e.message); return false }
-}
-
-async function loadVideo(k) {
-  try {
-    var d=await new Promise(function(r){chrome.storage.local.get([k],function(res){if(chrome.runtime.lastError){r(null);return};r(res[k]||null)})})
-    if(!d||!d.dataUrl){return null}
-    return d.dataUrl
-  } catch(e){return null}
-}
-
-// ===== State Detection (FORM_READY based) =====
-function isElementEditable(el) {
-  if (!el) return false
-  try {
-    var style = window.getComputedStyle(el)
-    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false
-    if (el.disabled || el.readOnly) return false
-    var rect = el.getBoundingClientRect()
-    if (rect.width === 0 || rect.height === 0) return false
-    return true
-  } catch(e) { return false }
-}
-
-function deepQuerySelector(sel, root) {
-  root = root || document
-  var found = root.querySelector(sel)
-  if (found) return found
-  var all = root.querySelectorAll("*")
-  for (var i = 0; i < all.length; i++) {
-    if (all[i].shadowRoot) {
-      var f = deepQuerySelector(sel, all[i].shadowRoot)
-      if (f) return f
+    // ★ v3.1.4: 找所有 iframe, 返回 form 元素最多的那个
+    var ifs = document.querySelectorAll("iframe")
+    var bestDoc: Document | null = null, bestCount = 0
+    for (var i = 0; i < ifs.length; i++) {
+      try {
+        var doc = (ifs[i] as any).contentDocument || (ifs[i] as any).contentWindow?.document
+        if (doc && doc.body) {
+          var count = doc.querySelectorAll("input, textarea, [contenteditable]").length
+          if (count > bestCount) { bestCount = count; bestDoc = doc }
+        }
+      } catch (e) { }
     }
-  }
+    if (bestDoc) return bestDoc
+  } catch (e) { }
   return null
+}
+var _wuDoc: Document | ShadowRoot | null = null  // cached
+function getWujieDocCached() { if (!_wuDoc) _wuDoc = getWujieDoc(); return _wuDoc }
+
+function wq(sel: string): Element | null {
+  try {
+    var d = getWujieDocCached()
+    if (d) { var el = d.querySelector(sel); if (el) return el }
+    return document.querySelector(sel)
+  } catch (e) { return document.querySelector(sel) }
+}
+
+function wqAll(sel: string): Element[] {
+  var res: Element[] = []
+  try {
+    var d = getWujieDocCached()
+    if (d) {
+      var l = d.querySelectorAll(sel)
+      for (var i = 0; i < l.length; i++) res.push(l[i])
+    }
+  } catch (e) { }
+  var main = document.querySelectorAll(sel)
+  for (var i = 0; i < main.length; i++) res.push(main[i])
+  return res
 }
 
 var adapter = {
-  findTitleInput: function() { return deepQuerySelector("input[placeholder*=\"\u6807\u9898\"], textarea[placeholder*=\"\u6807\u9898\"], input[placeholder*=\"title\"]") },
-  findDescInput: function() { return deepQuerySelector("textarea[placeholder*=\"\u7b80\u4ecb\"], textarea[placeholder*=\"\u63cf\u8ff0\"], div[contenteditable=true], [contenteditable=\"true\"]") },
-  isFormReady: function() {
+  findTitleInput: function () {
+    var el = wq('input[placeholder*="标题"], input[placeholder*="title"], input[placeholder*="Title"]')
+    if (el) return el
+    var all = wqAll('input[type=text]')
+    for (var i = 0; i < all.length; i++) {
+      if (isElementEditable(all[i])) return all[i]
+    }
+    return null
+  },
+  findDescInput: function () {
+    var eds = wqAll("div[contenteditable=true]")
+    if (eds.length > 0) {
+      var best: Element | null = null, bestArea = 0
+      for (var i = 0; i < eds.length; i++) {
+        if (!isElementEditable(eds[i])) continue
+        var rect = eds[i].getBoundingClientRect()
+        var area = rect.width * rect.height
+        if (area > bestArea) { bestArea = area; best = eds[i] }
+      }
+      if (best) return best
+    }
+    var tas = wqAll("textarea")
+    if (tas.length > 0) {
+      var best: Element | null = null, bestArea = 0
+      for (var i = 0; i < tas.length; i++) {
+        if (!isElementEditable(tas[i])) continue
+        var rect = tas[i].getBoundingClientRect()
+        var area = rect.width * rect.height
+        if (area > bestArea) { bestArea = area; best = tas[i] }
+      }
+      if (best) return best
+    }
+    return null
+  },
+  isFormReady: function () {
     var t = this.findTitleInput()
     return isElementEditable(t)
   },
-  detectState: function() {
+  detectState: function () {
     var text = document.body.innerText || ""
-    if (/\u767b\u5f55|\u8bf7\u767b\u5f55|\u5b89\u5168\u9a8c\u8bc1/.test(text)) return "ERROR_LOGIN"
+    if (/登录|请登录|安全验证/.test(text)) return "ERROR_LOGIN"
     if (this.isFormReady()) return "FORM_READY"
-    if (/\u4e0a\u4f20\u4e2d|\u6b63\u5728\u4e0a\u4f20/.test(text)) return "UPLOADING"
-    if (/\u5904\u7406\u4e2d|\u89e3\u6790\u4e2d|\u8f6c\u7801\u4e2d/.test(text)) return "PROCESSING"
-    if (/\u4e0a\u4f20\u89c6\u9891|\u9009\u62e9\u89c6\u9891|\u70b9\u51fb\u4e0a\u4f20|\u8bf7\u5148\u4e0a\u4f20/.test(text)) return "WAITING_VIDEO"
+    if (/上传中|正在上传/.test(text)) return "UPLOADING"
+    if (/处理中|解析中|转码中/.test(text)) return "PROCESSING"
+    if (/上传视频|选择视频|点击上传|请先上传/.test(text)) return "WAITING_VIDEO"
     return "UNKNOWN"
   },
-  diagnose: function() {
+  diagnose: function () {
     var t = this.findTitleInput()
     var d = this.findDescInput()
     var text = document.body.innerText || ""
@@ -145,140 +136,251 @@ var adapter = {
       descEditable: isElementEditable(d),
       iframeCount: document.querySelectorAll("iframe").length,
       signals: {
-        uploading: /\u4e0a\u4f20\u4e2d|\u6b63\u5728\u4e0a\u4f20/.test(text),
-        processing: /\u5904\u7406\u4e2d|\u89e3\u6790\u4e2d|\u8f6c\u7801\u4e2d/.test(text),
-        waitingUpload: /\u4e0a\u4f20\u89c6\u9891|\u9009\u62e9\u89c6\u9891|\u70b9\u51fb\u4e0a\u4f20|\u8bf7\u5148\u4e0a\u4f20/.test(text)
+        uploading: /上传中|正在上传/.test(text),
+        processing: /处理中|解析中|转码中/.test(text),
+        waitingUpload: /上传视频|选择视频|点击上传|请先上传/.test(text)
       }
     }
   }
 }
 
-async function waitForFormReady(timeout) {
-  timeout = timeout || 900000
-  logInfo("Waiting for form ready...")
-  return new Promise(function(resolve) {
-    var observer = new MutationObserver(function() {
-      if (adapter.isFormReady()) { cleanup(); resolve(true) }
-    })
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true })
-    var timer = setInterval(function() {
-      timeout -= 1000
-      if (timeout <= 0) { cleanup(); logFail("Form not ready within timeout"); resolve(false); return }
-      if (adapter.isFormReady()) { cleanup(); resolve(true); return }
-    }, 1000)
-    function cleanup() { observer.disconnect(); clearInterval(timer) }
-    if (adapter.isFormReady()) { cleanup(); resolve(true) }
-  })
-}
+// ===== Fill Form (Shipinhao-specific with wujie support) =====
+async function fillForm(title: string, descText: string, tags: string[]) {
+  logInfo("Filling form...")
+  await sleep(500)
 
-// ===== Diagnostic Overlay =====
-var _overlay = null
-function showOverlay() {
-  if (_overlay) return
-  _overlay = document.createElement("div")
-  _overlay.id = "vp_overlay"
-  _overlay.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999999;background:#1677ff;color:#fff;padding:8px 16px;font-size:13px;font-family:sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.15)"
-  document.body.prepend(_overlay)
-  _overlay._timer = setInterval(function() {
-    if (!_overlay) return
-    var d = adapter.diagnose()
-    var sl = {FORM_READY:1,UPLOADING:2,PROCESSING:3,WAITING_VIDEO:4,ERROR_LOGIN:5,UNKNOWN:6}
-    // Build text safely - no innerHTML with Chinese
-    var txt = "mu" + "lti-pub [" + PLATFORM + "]"
-    var st = ["","form ready","uploading","processing","wait video","need login","unknown"][sl[d.state]||6]
-    txt += " | title:" + (d.titleEditable ? "ok" : "no")
-    txt += " desc:" + (d.descEditable ? "ok" : "no")
-    txt += " iframes:" + d.iframeCount
-    _overlay.textContent = txt
-    _overlay.style.fontSize = "11px"
-  }, 2000)
-}
-
-function hideOverlay() {
-  if (_overlay) {
-    if (_overlay._timer) clearInterval(_overlay._timer)
-    _overlay.remove()
-    _overlay = null
+  // Title
+  if (title) {
+    var inputs = wqAll("input")
+    var ok = false
+    for (var i = 0; i < inputs.length; i++) {
+      var inp = inputs[i] as HTMLInputElement
+      if (inp.type === "file" || inp.type === "hidden") continue
+      var ph = (inp.placeholder || "").toLowerCase()
+      if (ph.indexOf("title") >= 0 || ph.indexOf("标题") >= 0 || ph.indexOf("视频") >= 0) {
+        if (setNativeValue(inp, title)) { ok = true; logOk("Title: OK"); break }
+      }
+    }
+    if (!ok) {
+      for (var i = 0; i < inputs.length; i++) {
+        if ((inputs[i] as HTMLInputElement).type !== "file" && (inputs[i] as HTMLInputElement).type !== "hidden") {
+          if (setNativeValue(inputs[i] as HTMLInputElement, title)) { ok = true; logOk("Title: fallback"); break }
+        }
+      }
+    }
+    if (!ok) logFail("Title: not found")
   }
+
+  await sleep(300)
+
+  // Description + Tags (视频号的话题通常在描述框里输入 #话题 触发)
+  var fullDesc = descText || ""
+  if (tags && tags.length > 0) {
+    var n = normalizeTags(tags)
+    var tagStr = n.join(" ")
+    if (fullDesc) fullDesc += "\n" + tagStr
+    else fullDesc = tagStr
+  }
+
+  if (fullDesc) {
+    // ★ v3.1.4: 诊断日志 — 列出所有可编辑元素
+    var eds = wqAll("div[contenteditable=true]")
+    var tas = wqAll("textarea")
+    logInfo("Form elements found: " + eds.length + " contenteditables, " + tas.length + " textareas")
+    for (var di = 0; di < eds.length; di++) {
+      var r = eds[di].getBoundingClientRect()
+      logInfo("  ce[" + di + "]: " + Math.round(r.width) + "x" + Math.round(r.height) + " visible=" + ((eds[di] as HTMLElement).offsetParent !== null))
+    }
+    for (var di = 0; di < tas.length; di++) {
+      var r = tas[di].getBoundingClientRect()
+      logInfo("  ta[" + di + "]: " + Math.round(r.width) + "x" + Math.round(r.height) + " placeholder=" + ((tas[di] as HTMLTextAreaElement).placeholder || "").slice(0,20))
+    }
+
+    // Strategy 1: contenteditable divs (most common in modern apps)
+    var bestEd: HTMLElement | null = null
+    var bestArea = 0
+    for (var i = 0; i < eds.length; i++) {
+      var el = eds[i] as HTMLElement
+      if (!isElementEditable(el)) continue
+      var rect = el.getBoundingClientRect()
+      var area = rect.width * rect.height
+      if (area > bestArea) { bestArea = area; bestEd = el }
+    }
+    if (bestEd) {
+      logInfo("Best contenteditable: area=" + Math.round(bestArea) + " tag=" + bestEd.tagName)
+      if (setCE(bestEd, fullDesc)) {
+        logOk("Desc+Tags: contenteditable (area=" + Math.round(bestArea) + ")")
+        // verify
+        await sleep(500)
+        logInfo("Desc verification: text length=" + ((bestEd as HTMLElement).innerText || "").length)
+      } else {
+        logFail("Desc+Tags: contenteditable set failed")
+      }
+    } else {
+      // Strategy 2: textareas
+      var bestTa: HTMLTextAreaElement | null = null
+      bestArea = 0
+      for (var i = 0; i < tas.length; i++) {
+        var el = tas[i] as HTMLTextAreaElement
+        if (!isElementEditable(el)) continue
+        var rect = el.getBoundingClientRect()
+        var area = rect.width * rect.height
+        if (area > bestArea) { bestArea = area; bestTa = el }
+      }
+      if (bestTa) {
+        logInfo("Best textarea: area=" + Math.round(bestArea) + " placeholder=" + (bestTa.placeholder || "").slice(0,20))
+        if (setNativeValue(bestTa, fullDesc)) logOk("Desc+Tags: textarea")
+        else logFail("Desc+Tags: textarea set failed")
+      } else {
+        logFail("Desc+Tags: no editable element found")
+      }
+    }
+  }
+
+  logInfo("Form fill done")
 }
 
-function showFormFillStatus() {
-  if (_overlay) _overlay.textContent = "multi-pub ["+PLATFORM+"] filling form..."
+function clickShipinhaoUpload(): boolean {
+  var keywords = ["上传视频", "选择视频", "upload", "select video", "上传", "发布视频", "拖拽视频", "点击上传", "choose file", "请选择要上传的视频", "请上传视频"]
+  var selectors = ["button", "div", "span", "a", "label", "[class*=upload]", "[class*=Upload]", "[class*=publish]", "[class*=Publish]"]
+  for (var s = 0; s < selectors.length; s++) {
+    var els = wqAll(selectors[s])
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i] as HTMLElement
+      var txt = (el.innerText || el.textContent || "").toLowerCase().trim()
+      if (!txt) continue
+      for (var k = 0; k < keywords.length; k++) {
+        if (txt.indexOf(keywords[k].toLowerCase()) >= 0) {
+          try {
+            el.click(); el.dispatchEvent(new Event("click", { bubbles: true }))
+            logInfo("Clicked upload trigger: " + txt.slice(0, 30))
+            return true
+          } catch (e) { }
+        }
+      }
+    }
+  }
+  return false
 }
-// ===== Fill Form (platform specific - replaced per platform) =====
 
-function getWujieDoc(){try{var app=document.querySelector("wujie-app");if(app){var sr=app.shadowRoot;if(sr){var iframe=sr.querySelector("iframe");if(iframe&&iframe.contentDocument)return iframe.contentDocument;return sr}}var ifs=document.querySelectorAll("iframe");for(var i=0;i<ifs.length;i++){try{var doc=ifs[i].contentDocument||ifs[i].contentWindow?.document;if(doc&&doc.body&&doc.body.querySelector("input,textarea"))return doc}catch(e){}}}catch(e){}return null}
-function wq(sel){var d=getWujieDoc();if(d){try{var el=d.querySelector(sel);if(el)return el}catch(e){}}return document.querySelector(sel)}
-function wqAll(sel){var d=getWujieDoc();if(d){try{var l=d.querySelectorAll(sel);if(l.length>0)return l}catch(e){}}return document.querySelectorAll(sel)}
-
-async function fillForm(title, descText, tags) {
-  logInfo("Filling...")
-  if(title){var inputs=wqAll("input");var ok=false;for(var i=0;i<inputs.length;i++){var inp=inputs[i];if(inp.type==="file"||inp.type==="hidden")continue;var ph=(inp.placeholder||"").toLowerCase();if(ph.indexOf("title")>=0||ph.indexOf("\u6807\u9898")>=0||ph.indexOf("\u89c6\u9891")>=0){if(setNativeValue(inp,title)){ok=true;logOk("Title: OK");break}}}if(!ok){for(var i=0;i<inputs.length;i++){if(inputs[i].type!=="file"&&inputs[i].type!=="hidden"){if(setNativeValue(inputs[i],title)){ok=true;logOk("Title: fallback");break}}}}if(!ok)logFail("Title: not found")}
-  if(descText){var eds=wqAll("div[contenteditable=true]");var ok=false;for(var i=0;i<eds.length;i++){if(setCE(eds[i],descText)){ok=true;logOk("Desc: OK");break}}if(!ok){var tas=wqAll("textarea");for(var i=0;i<tas.length;i++){if(setNativeValue(tas[i],descText)){ok=true;logOk("Desc: textarea");break}}}if(!ok)logFail("Desc: not found")}
-  if(tags&&tags.length>0){var n=normalizeTags(tags);var ts=n.join(" ");var ok=false;var tis=wqAll("input[placeholder*=\"#\"],input[placeholder*=\"\u8bdd\u9898\"]");for(var i=0;i<tis.length;i++){if(setNativeValue(tis[i],ts)){tis[i].dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));ok=true;logOk("Tags: OK");break}}if(!ok){var eds=wqAll("div[contenteditable=true]");for(var i=0;i<eds.length;i++){var cur=eds[i].innerText;if(cur&&setCE(eds[i],cur+"\n"+ts)){ok=true;logOk("Tags: appended");break}}}if(!ok)logFail("Tags: not filled")}
-  logInfo("Done")
+async function waitForFileInput(maxWait: number): Promise<boolean> {
+  var elapsed = 0
+  while (elapsed < maxWait) {
+    var all = wqAll('input[type="file"]')
+    for (var i = 0; i < all.length; i++) {
+      var inp = all[i] as HTMLInputElement
+      var acc = (inp.getAttribute("accept") || "").toLowerCase()
+      if (!acc || acc.indexOf("video") >= 0) return true
+    }
+    await sleep(500)
+    elapsed += 500
+  }
+  return false
 }
-
-
-// ===== Main Process =====
-async function processPublish(data) {
-  logInfo("Start")
+var _loginOverlay: HTMLElement | null = null
+function showLoginOverlay() {
+  if (_loginOverlay) return
+  _loginOverlay = document.createElement("div")
+  _loginOverlay.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999999;background:#ff4d4f;color:#fff;padding:24px 32px;border-radius:12px;font-size:16px;font-family:sans-serif;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.25);max-width:420px;line-height:1.6"
+  _loginOverlay.innerHTML = "<div style='font-size:20px;font-weight:bold;margin-bottom:12px'>视频号需要登录</div><div>请使用微信扫码登录。<br/>登录成功后页面会自动刷新并继续发布视频。<br/><span style='font-size:13px;opacity:.85'>此标签页请保持打开，不要关闭。</span></div>"
+  document.body.appendChild(_loginOverlay)
+}
+function hideLoginOverlay() {
+  if (_loginOverlay) { _loginOverlay.remove(); _loginOverlay = null }
+}
+async function processPublish(raw: any) {
+  var data = raw.platformData || raw  // ★ 解包
+  logInfo("Start processing")
   var fileName = data.videoFileName || "video.mp4"
-  
-  // Step 1: Show diagnostic overlay
-  showOverlay()
-  
-  // Step 2: Try auto inject (best-effort)
-  if (data.videoStorageKey) {
-    var du = await loadVideo(data.videoStorageKey)
-    if (du) await tryInjectVideo(du, fileName)
+
+  showOverlay(PLATFORM, adapter)
+
+  logInfo("Waiting for upload area...")
+  var uploadReady = false
+  for (var i = 0; i < 30; i++) {
+    var state = adapter.detectState()
+    if (state === "ERROR_LOGIN") {
+      logInfo("Login page detected - waiting for user scan")
+      updStatus(PLATFORM, TASK_ID, "waiting_login")
+      showLoginOverlay()
+      await new Promise(function () { })  // block forever; page will refresh after login
+      return
+    }
+    if (state === "FORM_READY" || state === "WAITING_VIDEO" || state === "UPLOADING" || state === "PROCESSING") {
+      uploadReady = true
+      break
+    }
+    await sleep(1000)
   }
-  
-  // Step 3: Wait for FORM_READY (not upload complete!)
+  if (!uploadReady) {
+    logInfo("Upload area not detected, will try inject anyway")
+  }
+
+  // Video号: actively click upload trigger so wujie iframe creates the file input
+  logInfo("Clicking upload trigger for shipinhao...")
+  var clicked = clickShipinhaoUpload()
+  if (clicked) {
+    logInfo("Waiting for file input to appear...")
+    var hasInput = await waitForFileInput(15000)
+    logInfo("File input after click: " + (hasInput ? "yes" : "no"))
+  }
+
+  // Try CDP direct file injection (background uses Task's videoFilePath)
+  logInfo("Attempting CDP injection...")
+  var injected = await injectVideoToInput(TASK_ID, fileName, data.videoFileType)
+
+  if (!injected) {
+    logInfo("CDP injection failed, waiting for manual upload...")
+  }
+
   logInfo("Waiting for form ready...")
-  var ready = await waitForFormReady(900000)
+  var ready = await waitForFormReady(adapter, 900000)
   hideOverlay()
-  
+
   if (!ready) {
     logFail("Form not ready within timeout")
     return
   }
-  
+
   await sleep(2000)
-  
-  // Step 4: Fill form
-  showFormFillStatus()
+
+  showFormFillStatus(PLATFORM)
   var descText = data.content || ""
   await fillForm(data.title || "", descText, data.tags || [])
-  
-  logOk("Done")
+
+  logOk("All done - please review and submit manually")
 }
 
 // ===== Heartbeat + Task Claim =====
-var _hb = null
-function startHB() { _hb = setInterval(function(){chrome.runtime.sendMessage({action:"HEARTBEAT",platform:PLATFORM,url:location.href}).catch(function(){})},5000) }
-function stopHB() { if(_hb){clearInterval(_hb);_hb=null} }
-
-async function claimTask(n) {
-  n=n||20
-  for(var i=0;i<n;i++){
-    try {
-      var r = await new Promise(function(resolve){chrome.runtime.sendMessage({action:"CLAIM_TASK",platform:PLATFORM},function(resp){if(chrome.runtime.lastError){resolve({ok:false})}else{resolve(resp||{ok:false})}})})
-      if(r&&r.ok){TASK_ID=r.taskId;return r.platformData}
-    } catch(e){}
-    await sleep(1000)
-  }
-  return null
-}
-
-async function updStatus(tid,st,err) {
-  chrome.runtime.sendMessage({action:"UPDATE_TASK_STATUS",taskId:tid,platform:PLATFORM,status:st,error:err||""}).catch(function(){})
-}
+var _hb: ReturnType<typeof setInterval> | null = null
+function startHeartbeat() { _hb = startHB(PLATFORM) }
+function stopHeartbeat() { if (_hb) { clearInterval(_hb); _hb = null } }
 
 // ===== Boot =====
-startHB()
-logInfo("Ready")
-claimTask(20).then(function(td){if(!td){logInfo("No task");return}
-  updStatus(td.taskId,"filling")
-  processPublish(td).then(function(){updStatus(td.taskId,"done");stopHB();hideOverlay()}).catch(function(e){logFail(e.message);updStatus(td.taskId,"error",e.message)})
-}).catch(function(e){logFail("Boot: "+e.message)})
+startHeartbeat()
+logInfo("Ready v" + VERSION)
+claimTask(PLATFORM, 20).then(function (td) {
+  if (!td) { logInfo("No task claimed"); return }
+  TASK_ID = td.taskId
+
+  // Immediate login check before doing anything
+  if (adapter.detectState() === "ERROR_LOGIN") {
+    logInfo("Login page detected at boot - waiting for user scan")
+    showOverlay(PLATFORM, adapter)
+    updStatus(PLATFORM, td.taskId, "waiting_login")
+    showLoginOverlay()
+    return
+  }
+
+  updStatus(PLATFORM, td.taskId, "filling")
+  processPublish(td).then(function () {
+    updStatus(PLATFORM, td.taskId, "done")
+    stopHeartbeat()
+    hideOverlay()
+  }).catch(function (e: any) {
+    logFail(e.message)
+    updStatus(PLATFORM, td.taskId, "error", e.message)
+  })
+}).catch(function (e: any) {
+  logFail("Boot: " + e.message)
+})

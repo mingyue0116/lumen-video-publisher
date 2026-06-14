@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from "react"
 
-const VERSION = "2.4.0"
+const VERSION = "3.1.4"
 const DRAFT_KEY = "publish_draft_v3"
+// CACHE_BUST_20260614_002_LARGE_CHANGE_TO_FORCE_REBUILD_XYZ123456789
 
 var I: Record<string, React.ReactElement> = {
   douyin: React.createElement("svg", { viewBox: "0 0 24 24", width: 14, height: 14, fill: "currentColor", style: { verticalAlign: "middle", marginRight: 3 } },
@@ -84,23 +85,39 @@ function SidePanel() {
   }
 
   async function publishAll() {
-    if (!vf || sel.size === 0) return
+    console.log("[SidePanel] publishAll called. vf=", !!vf, "sel.size=", sel.size)
+    if (!vf || sel.size === 0) {
+      console.warn("[SidePanel] publishAll blocked: no file or no platforms")
+      if (!vf) alert("请先选择视频文件！")
+      return
+    }
     setPub(true)
 
     try {
-      var du = await new Promise<string>(function(res, rej) {
-        var r = new FileReader()
-        r.onload = function() { res(r.result as string) }
-        r.onerror = function() { rej(new Error("Read failed")) }
-        r.readAsDataURL(vf!)
-      })
+      // Path A: Chrome 扩展上下文的 File 对象有 path 属性（最佳方案）
+      var filePath = (vf as any).path || ""
+      console.log("[SidePanel] File.path:", filePath || "(not available)")
 
-      var sk = "video_" + Date.now()
-      await new Promise<void>(function(res, rej) {
-        chrome.storage.local.set({ [sk]: { dataUrl: du, videoName: vf!.name, videoType: vf!.type || "video/mp4" } }, function() {
-          if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message)); else res()
-        })
-      })
+      // Path B: 只有当 File.path 不可用时，才读 dataUrl 作为兜底
+      var dataUrl = ""
+      if (!filePath) {
+        var fileSizeMB = vf!.size / 1024 / 1024
+        if (fileSizeMB < 50) {  // 50MB 以内才读 dataUrl，避免 message 过大
+          try {
+            dataUrl = await new Promise<string>(function(res, rej) {
+              var r = new FileReader()
+              r.onload = function() { res(r.result as string) }
+              r.onerror = function() { rej(new Error("Read failed")) }
+              r.readAsDataURL(vf!)
+            })
+            console.log("[SidePanel] DataUrl ready:", dataUrl.length, "chars")
+          } catch (e: any) {
+            console.warn("[SidePanel] DataUrl read failed:", e.message)
+          }
+        } else {
+          console.warn("[SidePanel] File too large for dataUrl fallback:", fileSizeMB.toFixed(0), "MB")
+        }
+      }
 
       var tl = parseTags(tags)
       var pls = Array.from(sel)
@@ -109,18 +126,27 @@ function SidePanel() {
         action: "CREATE_TASK",
         payload: {
           title: title, content: content, tags: tl,
-          videoStorageKey: sk, videoFileName: vf!.name, videoFileType: vf!.type || "video/mp4",
+          videoFilePath: filePath,
+          videoDataUrl: dataUrl,
+          videoFileName: vf!.name, videoFileType: vf!.type || "video/mp4",
           platforms: pls
         }
       })
 
-      if (!r || !r.success) { console.error("Create failed"); return }
+      if (!r || !r.success) {
+        console.error("[SidePanel] Create failed:", r)
+        alert("创建任务失败: " + (r && r.error ? r.error : "请检查 Background 日志"))
+        return
+      }
 
       await chrome.runtime.sendMessage({ action: "START_PUBLISH", taskId: r.task.taskId })
       load()
-    } catch(err: any) { console.error(err) }
-
-    setPub(false)
+    } catch(err: any) {
+      console.error("[SidePanel] publishAll error:", err)
+      alert("发布出错: " + (err.message || err))
+    } finally {
+      setPub(false)
+    }
   }
 
   function clearDraft() {
