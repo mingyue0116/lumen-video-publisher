@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from "react"
 
-const VERSION = "3.1.4"
+const VERSION = "3.2.0"
 const DRAFT_KEY = "publish_draft_v3"
-// CACHE_BUST_20260614_002_LARGE_CHANGE_TO_FORCE_REBUILD_XYZ123456789
+// ★ 分块大小：1.5MB（base64 后约 2MB，安全在 chrome 消息体限制内）
+const CHUNK_BYTES = 1.5 * 1024 * 1024
 
 var I: Record<string, React.ReactElement> = {
   douyin: React.createElement("svg", { viewBox: "0 0 24 24", width: 14, height: 14, fill: "currentColor", style: { verticalAlign: "middle", marginRight: 3 } },
@@ -54,6 +55,7 @@ function SidePanel() {
   var _f = useState(""), tags = _f[0], setTags = _f[1]
   var _g = useState<any[]>([]), tasks = _g[0], setTasks = _g[1]
   var _h = useState(false), pub = _h[0], setPub = _h[1]
+  var _h2 = useState(""), pubText = _h2[0], setPubText = _h2[1]
   var _i = useState<Set<string>>(new Set(["douyin"])), sel = _i[0], setSel = _i[1]
   var vr = useRef<HTMLInputElement>(null)
   var tr = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -84,6 +86,44 @@ function SidePanel() {
     var f = fs[0]; setVf(f); setVn(f.name); setVs((f.size / 1024 / 1024).toFixed(1) + "MB")
   }
 
+  // 把视频文件分块读成 base64，逐块发给 background 暂存，返回 storeId
+  async function uploadVideoChunks(file: File, onProgress: (p: number) => void): Promise<string> {
+    var totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_BYTES))
+    var storeId = ""
+    var type = file.type || "video/mp4"
+
+    for (var i = 0; i < totalChunks; i++) {
+      var start = i * CHUNK_BYTES
+      var end = Math.min(start + CHUNK_BYTES, file.size)
+      var blob = file.slice(start, end)
+
+      var base64 = await new Promise<string>(function(res, rej) {
+        var r = new FileReader()
+        r.onload = function() {
+          // readAsDataURL 返回 "data:...;base64,XXXX"，只取后面的纯 base64
+          var s = r.result as string
+          var idx = s.indexOf(",")
+          res(idx >= 0 ? s.slice(idx + 1) : s)
+        }
+        r.onerror = function() { rej(new Error("读取视频分块失败 chunk " + i)) }
+        r.readAsDataURL(blob)
+      })
+
+      var resp = await chrome.runtime.sendMessage({
+        action: "STORE_VIDEO_CHUNK",
+        storeId: storeId,         // 第一片为空，background 会生成并返回
+        name: file.name, type: type,
+        chunk: base64,
+        done: i === totalChunks - 1,
+        totalBytes: file.size
+      })
+      if (!resp || !resp.success) throw new Error("上传视频分块失败 chunk " + i + ": " + (resp && resp.error))
+      if (!storeId) storeId = resp.storeId
+      onProgress(Math.round(((i + 1) / totalChunks) * 100))
+    }
+    return storeId
+  }
+
   async function publishAll() {
     console.log("[SidePanel] publishAll called. vf=", !!vf, "sel.size=", sel.size)
     if (!vf || sel.size === 0) {
@@ -92,42 +132,24 @@ function SidePanel() {
       return
     }
     setPub(true)
+    setPubText("读取视频 0%")
 
     try {
-      // Path A: Chrome 扩展上下文的 File 对象有 path 属性（最佳方案）
-      var filePath = (vf as any).path || ""
-      console.log("[SidePanel] File.path:", filePath || "(not available)")
-
-      // Path B: 只有当 File.path 不可用时，才读 dataUrl 作为兜底
-      var dataUrl = ""
-      if (!filePath) {
-        var fileSizeMB = vf!.size / 1024 / 1024
-        if (fileSizeMB < 50) {  // 50MB 以内才读 dataUrl，避免 message 过大
-          try {
-            dataUrl = await new Promise<string>(function(res, rej) {
-              var r = new FileReader()
-              r.onload = function() { res(r.result as string) }
-              r.onerror = function() { rej(new Error("Read failed")) }
-              r.readAsDataURL(vf!)
-            })
-            console.log("[SidePanel] DataUrl ready:", dataUrl.length, "chars")
-          } catch (e: any) {
-            console.warn("[SidePanel] DataUrl read failed:", e.message)
-          }
-        } else {
-          console.warn("[SidePanel] File too large for dataUrl fallback:", fileSizeMB.toFixed(0), "MB")
-        }
-      }
+      // 分块把视频字节流到 background 内存（不再用 File.path / dataUrl）
+      var storeId = await uploadVideoChunks(vf!, function(p) {
+        setPubText("读取视频 " + p + "%")
+      })
+      console.log("[SidePanel] video stored, storeId=", storeId)
 
       var tl = parseTags(tags)
       var pls = Array.from(sel)
 
+      setPubText("创建任务…")
       var r = await chrome.runtime.sendMessage({
         action: "CREATE_TASK",
         payload: {
           title: title, content: content, tags: tl,
-          videoFilePath: filePath,
-          videoDataUrl: dataUrl,
+          videoStoreId: storeId,
           videoFileName: vf!.name, videoFileType: vf!.type || "video/mp4",
           platforms: pls
         }
@@ -139,6 +161,7 @@ function SidePanel() {
         return
       }
 
+      setPubText("打开平台…")
       await chrome.runtime.sendMessage({ action: "START_PUBLISH", taskId: r.task.taskId })
       load()
     } catch(err: any) {
@@ -146,6 +169,7 @@ function SidePanel() {
       alert("发布出错: " + (err.message || err))
     } finally {
       setPub(false)
+      setPubText("")
     }
   }
 
@@ -222,7 +246,7 @@ function SidePanel() {
           color: "#fff", border: "none", borderRadius: 3, fontSize: 12, fontWeight: 600,
           cursor: pub ? "not-allowed" : "pointer"
         }
-      }, pub ? "\u53d1\u5e03\u4e2d..." : "\u53d1\u5e03"),
+      }, pub ? (pubText || "\u53d1\u5e03\u4e2d...") : "\u53d1\u5e03"),
       React.createElement("button", {
         onClick: clearDraft,
         style: { padding: "6px 10px", background: "#fff", color: "#ff4d4f", border: "1px solid #ff4d4f", borderRadius: 3, fontSize: 11, cursor: "pointer" }

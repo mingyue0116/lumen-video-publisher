@@ -1,8 +1,9 @@
-// ===== Video Publisher Shared Utils - v2.8.0 =====
+// ===== Video Publisher Shared Utils - v3.2.0 =====
 // 跨平台共享的视频注入和表单填充工具函数
-// v2.8: 使用 CDP 直接注入本地文件路径（非 dataUrl），无下载无存储
+// v3.2: 视频字节由 sidepanel 分块上传到 background 内存，再用 CDP
+//       DOM.setFileInputFiles 的 contents 参数按 nodeId 注入真实字节
 
-export const VERSION = "3.1.4"
+export const VERSION = "3.2.1"
 
 export function sleep(ms: number) {
   return new Promise<void>(function (r) { setTimeout(r, ms) })
@@ -232,23 +233,18 @@ export async function injectVideoViaCDP(
   })
 }
 
-// ===== Main video injection entry point (v2.8 simplified) =====
+// ===== Main video injection entry point (v3.2 — 字节注入) =====
+// Background 从内存 store 拼出完整 base64，用 CDP DOM.setFileInputFiles contents 注入
 export async function injectVideoToInput(
   taskId: string,
   fileName: string,
   fileType: string
 ): Promise<boolean> {
   try {
-    // PRIMARY: CDP direct file path injection
-    logInfo("Trying CDP direct file injection...")
+    logInfo("Trying CDP contents injection...")
     var cdpSuccess = await injectVideoViaCDP(taskId, fileName, fileType)
     if (cdpSuccess) {
-      await sleep(2000)
-      var text = document.body.innerText || ""
-      if (/上传中|正在上传|处理中|解析中|转码中/.test(text)) {
-        logOk("CDP verified - upload in progress!")
-        return true
-      }
+      // 只信任 CDP 的 success 返回；不再用页面文本"上传中"判定（太不可靠，多平台文案各异）
       logOk("CDP injection completed")
       return true
     }

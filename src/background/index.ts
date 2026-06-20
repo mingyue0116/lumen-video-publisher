@@ -1,6 +1,6 @@
-// ===== Video Publisher - Background Script v3.0 =====
-// 双路径注入：1) File.path 直连 CDP  2) dataUrl → downloads → CDP
-const VERSION = "3.1.4"
+// ===== Video Publisher - Background Script v3.2 =====
+// 注入方式：sidepanel 分块读视频字节 → background 内存暂存 → downloads 写临时文件 → CDP files 注入
+const VERSION = "3.2.1"
 const TASKS_KEY = "publishTasks"
 
 interface PlatformState {
@@ -9,9 +9,29 @@ interface PlatformState {
 interface PublishTask {
   taskId: string; groupId?: number; title: string; content: string
   tags: string[]; videoFileName: string; videoFileType: string
-  videoFilePath: string; videoDataUrl: string   // ← 双保险
+  videoStoreId?: string   // ← 视频字节存内存 Map 的 key（不再用 path / dataUrl）
   createdAt: number; updatedAt: number
   platforms: Record<string, PlatformState>
+}
+
+// ===== In-memory video byte store（不落 storage.local，无体积上限）=====
+interface StoredVideo {
+  name: string; type: string; chunks: string[]; totalBytes: number; ready: boolean; createdAt: number
+}
+const _videoStore = new Map<string, StoredVideo>()
+const VIDEO_TTL_MS = 30 * 60 * 1000   // 30 分钟未用即清理，避免内存泄漏
+
+function newStoreId(): string { return "vid_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) }
+// 周期性清掉过期 / 未完成的孤儿条目
+setInterval(function () {
+  var now = Date.now()
+  _videoStore.forEach(function (v, k) {
+    if (now - v.createdAt > VIDEO_TTL_MS) { _videoStore.delete(k); console.log("[BG] video store expired:", k) }
+  })
+}, 5 * 60 * 1000)
+function peekVideo(storeId: string): StoredVideo | null {
+  // 多平台共用同一份视频，这里只读不删；由 TTL（30 分钟）兜底清理
+  return _videoStore.get(storeId) || null
 }
 
 const PLATFORM_URLS: Record<string, string> = {
@@ -77,6 +97,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     closeWorkspace(msg.taskId).then(() => sendResponse({ success: true }))
       .catch(e => sendResponse({ success: false, error: e.message })); return true
   }
+  // ===== 分块视频字节暂存（同步响应，无需 await）=====
+  if (msg.action === "STORE_VIDEO_CHUNK") {
+    try {
+      var storeId = msg.storeId || newStoreId()
+      var v = _videoStore.get(storeId)
+      if (!v) {
+        v = {
+          name: msg.name || "video.mp4", type: msg.type || "video/mp4",
+          chunks: [], totalBytes: msg.totalBytes || 0, ready: false, createdAt: Date.now()
+        }
+        _videoStore.set(storeId, v)
+      }
+      if (msg.chunk) v.chunks.push(msg.chunk)
+      if (msg.done) {
+        v.ready = true
+        console.log("[BG] video store ready:", storeId, "chunks=" + v.chunks.length,
+          "totalBytes=" + (v.totalBytes / 1024 / 1024).toFixed(1) + "MB")
+      }
+      sendResponse({ success: true, storeId: storeId, received: v.chunks.length })
+    } catch (e: any) {
+      sendResponse({ success: false, error: e.message })
+    }
+    return true
+  }
   // ===== CDP Injection =====
   if (msg.action === "INJECT_VIDEO_CDP") {
     var tabId = sender.tab?.id
@@ -86,50 +130,75 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 })
 
-// ===== Core: Video Injection (双路径) =====
+// ===== Core: Video Injection（CDP contents 字节注入，单一可靠路径）=====
 async function injectVideo(tabId: number, taskId: string): Promise<any> {
   var tasks = await getTasks()
   var task: PublishTask | null = null
   for (var i = 0; i < tasks.length; i++) { if (tasks[i].taskId === taskId) { task = tasks[i]; break } }
   if (!task) throw new Error("Task not found: " + taskId)
 
-  // 路径 A: File.path 直连（最快，最可靠）
-  if (task.videoFilePath) {
-    console.log("[BG] PATH A: Using File.path:", task.videoFilePath)
-    try {
-      var result = await cdpInject(tabId, task.videoFilePath)
-      if (result) return { method: "filepath", ...result }
-      console.log("[BG] PATH A: CDP attached but injection failed")
-    } catch (e: any) {
-      console.log("[BG] PATH A failed:", e.message)
-    }
-  } else {
-    console.log("[BG] PATH A: No videoFilePath in task")
-  }
+  if (!task.videoStoreId) throw new Error("No videoStoreId in task — sidepanel 未上传视频字节")
+  var video = peekVideo(task.videoStoreId)
+  if (!video || !video.ready) throw new Error("Video bytes missing/not ready: " + task.videoStoreId)
 
-  // 路径 B: dataUrl 下载 → CDP
-  if (task.videoDataUrl) {
-    console.log("[BG] PATH B: Downloading from dataUrl...")
-    try {
-      var dlPath = await dlThenInject(tabId, task.videoDataUrl, task.videoFileName)
-      if (dlPath) {
-        var result2 = await cdpInject(tabId, dlPath)
-        if (result2) return { method: "download", ...result2 }
-      }
-    } catch (e: any) {
-      console.log("[BG] PATH B failed:", e.message)
-    }
-  } else {
-    console.log("[BG] PATH B: No videoDataUrl in task")
-  }
+  // 拼接完整 base64（FileReader 切片读出的每片都是标准 base64，直接拼接即可）
+  var base64 = video.chunks.join("")
+  console.log("[BG] Injecting video bytes: name=" + video.name, "type=" + video.type,
+    "base64Len=" + base64.length, "(~" + (base64.length * 0.75 / 1024 / 1024).toFixed(1) + "MB)")
 
-  throw new Error("Both injection paths failed. videoFilePath=" + (task.videoFilePath || "none") + " videoDataUrl=" + (task.videoDataUrl ? "present" : "none"))
+  var result = await cdpInject(tabId, base64, video.name)
+  return { method: "contents", ...result }
 }
 
 // ===== CDP Injection (supports top doc + shadow DOM + same-origin iframes) =====
-async function cdpInject(tabId: number, filePath: string): Promise<any> {
+
+// ===== Save base64 to temp file for CDP injection =====
+async function saveBase64ToTempFile(base64: string, fileName: string): Promise<string | null> {
+  return new Promise(function (resolve) {
+    var ext = fileName.split(".").pop() || "mp4"
+    var mimeMap: Record<string, string> = { mp4: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo", mkv: "video/x-matroska", webm: "video/webm" }
+    var mime = mimeMap[ext] || "video/mp4"
+    var dataUrl = "data:" + mime + ";base64," + base64
+
+    chrome.downloads.download({
+      url: dataUrl,
+      filename: "__vp_temp_" + Date.now() + "_" + fileName,
+      saveAs: false,
+      conflictAction: "overwrite"
+    }, function (downloadId) {
+      if (chrome.runtime.lastError || !downloadId) {
+        console.log("[BG] download failed:", chrome.runtime.lastError?.message || "no id")
+        resolve(null); return
+      }
+      console.log("[BG] download started:", downloadId)
+
+      var onChanged = function (delta: any) {
+        if (delta.id !== downloadId) return
+        if (delta.state && delta.state.current === "complete") {
+          chrome.downloads.onChanged.removeListener(onChanged)
+          chrome.downloads.search({ id: downloadId }, function (items) {
+            chrome.downloads.erase({ id: downloadId }).catch(function () {})
+            if (items && items.length > 0) {
+              resolve(items[0].filename)
+            } else {
+              console.log("[BG] download search empty")
+              resolve(null)
+            }
+          })
+        }
+      }
+      chrome.downloads.onChanged.addListener(onChanged)
+      // Timeout: 30s
+      setTimeout(function () {
+        chrome.downloads.onChanged.removeListener(onChanged)
+        resolve(null)
+      }, 30000)
+    })
+  })
+}
+async function cdpInject(tabId: number, base64: string, fileName: string): Promise<any> {
   var dbg = { tabId: tabId }
-  console.log("[BG] CDP: attaching, path=", filePath)
+  console.log("[BG] CDP: attaching for contents injection")
 
   await chrome.debugger.attach(dbg, "1.3")
   console.log("[BG] CDP: attached")
@@ -195,19 +264,28 @@ async function cdpInject(tabId: number, filePath: string): Promise<any> {
     }
     if (vidNids.length > 0) nids = vidNids
 
-    // Try injection
+    // 注入：contents 参数不存在！改为先下载 base64 到本地临时文件，再用 files 注入
+    console.log("[BG] CDP: saving base64 to temp file via downloads...")
+    var filePath = await saveBase64ToTempFile(base64, fileName)
+    if (!filePath) throw new Error("Failed to save temp file")
+    console.log("[BG] CDP: temp file saved:", filePath)
+
+    var lastErr = ""
     for (var i = 0; i < nids.length; i++) {
       try {
-        console.log("[BG] CDP: inject nodeId=", nids[i], "files=[" + filePath + "]")
-        await chrome.debugger.sendCommand(dbg, "DOM.setFileInputFiles", { nodeId: nids[i], files: [filePath] })
+        console.log("[BG] CDP: setFileInputFiles files nodeId=", nids[i], "path=" + filePath)
+        await chrome.debugger.sendCommand(dbg, "DOM.setFileInputFiles", {
+          nodeId: nids[i],
+          files: [filePath]
+        })
         console.log("[BG] CDP: SUCCESS! nodeId=", nids[i])
         return { injected: true, nodeId: nids[i], filePath: filePath }
       } catch (e: any) {
+        lastErr = e.message
         console.log("[BG] CDP: nodeId", nids[i], "failed:", e.message)
       }
     }
-    throw new Error("CDP injection failed on all " + nids.length + " file inputs")
-  } finally {
+    throw new Error("CDP files injection failed on all " + nids.length + " inputs" + (lastErr ? ": " + lastErr : ""))
     try { await chrome.debugger.detach(dbg) } catch (_) { }
   }
 }
@@ -263,63 +341,6 @@ async function collectFileInputs(dbg: any, rootId: number): Promise<number[]> {
   return found
 }
 
-// ===== Path B: Download dataUrl → get path → CDP =====
-async function dlThenInject(tabId: number, dataUrl: string, fileName: string): Promise<string | null> {
-  var safeName = (fileName || "video.mp4").replace(/[<>:"/\\|?*]/g, "_")
-  var dlFilename = "video-publisher-temp/" + safeName
-
-  console.log("[BG] PATH B: downloading as", dlFilename)
-
-  // Use data: URL directly (NO blob URL conversion!)
-  var dlId = await new Promise<number | undefined>(function (resolve) {
-    chrome.downloads.download({
-      url: dataUrl,
-      filename: dlFilename,
-      conflictAction: "overwrite",
-      saveAs: false
-    }, function (id) {
-      if (chrome.runtime.lastError) {
-        console.log("[BG] PATH B: download error:", chrome.runtime.lastError.message)
-        resolve(undefined)
-      } else {
-        resolve(id)
-      }
-    })
-  })
-
-  if (!dlId) { console.log("[BG] PATH B: download failed to start"); return null }
-
-  // Wait for completion
-  var dlFilenameResult = await new Promise<string | null>(function (resolve) {
-    var attempts = 0
-    var iv = setInterval(function () {
-      attempts++
-      chrome.downloads.search({ id: dlId }, function (results) {
-        if (results.length === 0) { clearInterval(iv); resolve(null); return }
-        var d = results[0]
-        if (d.state === "complete") {
-          clearInterval(iv)
-          console.log("[BG] PATH B: download complete. filename from API:", d.filename)
-          resolve(d.filename)
-          return
-        }
-        if (d.state === "interrupted") {
-          clearInterval(iv); console.log("[BG] PATH B: download interrupted"); resolve(null); return
-        }
-        if (attempts > 240) { // 2 min timeout
-          clearInterval(iv); console.log("[BG] PATH B: download timeout"); resolve(null)
-        }
-      })
-    }, 500)
-  })
-
-  if (!dlFilenameResult) return null
-
-  // The filename from downloads API on Windows should be absolute
-  console.log("[BG] PATH B: resolved path:", dlFilenameResult)
-  return dlFilenameResult
-}
-
 // ===== Task CRUD =====
 async function getTasks(): Promise<PublishTask[]> {
   var r = await chrome.storage.local.get([TASKS_KEY])
@@ -337,23 +358,12 @@ function withStorageLock<T>(fn: () => Promise<T>): Promise<T> {
 
 async function handleCreateTask(payload: any): Promise<PublishTask> {
   return withStorageLock(async function () {
-    var filePath = payload.videoFilePath || ""
-    var dataUrl = payload.videoDataUrl || ""
-    // 如果已经有本地路径，就不需要把巨大的 dataUrl 存进 storage，避免超限
-    if (filePath) dataUrl = ""
-    // 兜底 dataUrl 也不能太大（storage.local 单条约 10MB）
-    if (dataUrl.length > 8 * 1024 * 1024) {
-      console.warn("[BG] DataUrl too large, truncating fallback")
-      dataUrl = ""
-    }
-
     var task: PublishTask = {
       taskId: "task_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
       title: payload.title || "", content: payload.content || "", tags: payload.tags || [],
       videoFileName: payload.videoFileName || "video.mp4",
       videoFileType: payload.videoFileType || "video/mp4",
-      videoFilePath: filePath,
-      videoDataUrl: dataUrl,
+      videoStoreId: payload.videoStoreId || "",
       createdAt: Date.now(), updatedAt: Date.now(), platforms: {}
     }
     var plats = payload.platforms || ["douyin"]
@@ -362,8 +372,8 @@ async function handleCreateTask(payload: any): Promise<PublishTask> {
     tasks.push(task)
     await saveTasks(tasks)
     console.log("[BG] Task created:", task.taskId,
-      "path:", task.videoFilePath || "(none)",
-      "dataUrl:", task.videoDataUrl ? task.videoDataUrl.length + " bytes" : "(none)")
+      "storeId:", task.videoStoreId || "(none)",
+      "storeHas:", task.videoStoreId ? (_videoStore.has(task.videoStoreId) ? "yes" : "MISSING") : "(none)")
     return task
   })
 }
@@ -568,8 +578,7 @@ async function handleClaimTask(platform: string, sender: any): Promise<any> {
       platformData: {
         taskId: task.taskId, platform: platform,
         title: task.title, content: task.content, tags: task.tags,
-        videoFileName: task.videoFileName, videoFileType: task.videoFileType,
-        videoFilePath: task.videoFilePath
+        videoFileName: task.videoFileName, videoFileType: task.videoFileType
       }
     }
   })

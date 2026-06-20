@@ -12,7 +12,7 @@ export const config: PlasmoCSConfig = {
 }
 
 const PLATFORM = "twitter"
-const VERSION = "3.1.4"
+const VERSION = "3.2.1"
 var TASK_ID = ""
 
 // ===== Logger =====
